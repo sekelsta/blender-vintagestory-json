@@ -89,7 +89,7 @@ def get_base_path(filepath_parts, curr_branch=None, new_branch=None):
         return "" # failed
 
 
-def create_textured_principled_bsdf(mat_name, tex_path):
+def create_textured_principled_bsdf(mat_name, tex_path, resolution, tex_width, tex_height):
     """Create new material with `mat_name` and texture path `tex_path`
     """
     mat = bpy.data.materials.new(mat_name)
@@ -109,7 +109,7 @@ def create_textured_principled_bsdf(mat_name, tex_path):
                 img = bpy.data.images.load(tex_path, check_existing=True)
             except:
                 print("FAILED TO LOAD IMAGE:", tex_path)
-                img = bpy.data.images.new(os.path.split(tex_path)[-1], width=16, height=16)
+                img = bpy.data.images.new(os.path.split(tex_path)[-1], width=resolution * tex_width, height=resolution * tex_height)
                 img.filepath = tex_path
         
             tex_input.image = img
@@ -285,7 +285,9 @@ def parse_element(
                         tex_name = face_uv["texture"][1:] # remove the "#" in start
                         if tex_name in mesh_materials:
                             face.material_index = mesh_materials[tex_name]
-                        elif tex_name in textures: # need new mapping
+                        else:
+                            if not tex_name in textures:
+                                textures[tex_name] = create_textured_principled_bsdf(tex_name, tex_name, 2, tex_width, tex_height)
                             idx = len(obj.data.materials)
                             obj.data.materials.append(textures[tex_name])
                             mesh_materials[tex_name] = idx
@@ -751,7 +753,7 @@ def load(context,
                 continue
             
             filepath_tex = os.path.join(tex_base_path, *tex_path.split("/")) + ".png"
-            textures[tex_name] = create_textured_principled_bsdf(tex_name, filepath_tex)
+            textures[tex_name] = create_textured_principled_bsdf(tex_name, filepath_tex, 2, tex_width, tex_height)
 
             # update stats
             if stats:
