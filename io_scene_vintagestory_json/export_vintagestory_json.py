@@ -288,6 +288,7 @@ def get_face_material(
     - tuple (r, g, b, a) if using a default color input
     - texture file name string "path" if using a texture input
     """
+    material = None
     if material_index < len(obj.material_slots):
         slot = obj.material_slots[material_index]
         material = slot.material
@@ -318,7 +319,7 @@ def get_face_material(
         
     return FaceMaterial(
         FaceMaterial.COLOR,
-        name=material.name,
+        name=material.name if material else 'null',
         color=default_color,
     )
 
