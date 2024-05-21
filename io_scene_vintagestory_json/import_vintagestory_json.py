@@ -1,5 +1,5 @@
 import os
-import json
+import pyjson5
 import numpy as np
 import math
 import time
@@ -710,7 +710,7 @@ def load(context,
     with open(filepath, "r") as f:
         s = f.read()
         try:
-            data = json.loads(s)
+            data = pyjson5.loads(s)
         except Exception as err:
             # sometimes format is in loose json, `name: value` instead of `"name": value`
             # this tries to add quotes to keys without double quotes
@@ -718,13 +718,10 @@ def load(context,
             try:
                 import re
                 s2 = re.sub("(\w+):", r'"\1":',  s)
-                data = json.loads(s2)
+                data = pyjson5.loads(s2)
             # unhandled issue
             except Exception as err:
                 raise err
-
-        
-        # data = json.load(f)
     
     # chunks of import file path, to get base directory
     filepath_parts = filepath.split(os.path.sep)
