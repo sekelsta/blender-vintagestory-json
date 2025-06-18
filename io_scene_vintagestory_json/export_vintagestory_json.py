@@ -1222,7 +1222,6 @@ ROTATION_MODE_TO_FCURVE_PROPERTY = {
 def save_all_animations(
     bone_hierarchy,
     rotate_shortest_distance=True, # shortest distance rotation interpolation
-    animation_version_0=False, # use old vintagestory animation version 0
 ):
     """Save all animation actions in Blender file
     """
@@ -1269,7 +1268,6 @@ def save_all_animations(
             armature=armature,
             on_animation_end=on_animation_end,
             rotate_shortest_distance=rotate_shortest_distance,
-            animation_version_0=animation_version_0,
         )
 
         # TODO: bake IKs?
@@ -1325,7 +1323,6 @@ def save_all_animations(
         action_export = {
             "name": action_name,
             "code": action_name,
-            "version": 0 if animation_version_0 else 1, # https://github.com/anegostudios/vsapi/blob/master/Common/Model/Shape/ShapeElement.cs#L277
             "quantityframes": quantity_frames,
             "onActivityStopped": on_activity_stopped,
             "onAnimationEnd": on_animation_end,
@@ -1493,7 +1490,6 @@ def save_objects(
     use_main_object_as_bone=True,
     use_step_parent=True,
     rotate_shortest_distance=True,
-    animation_version_0=False,
     logger=None,
     **kwargs
 ) -> tuple[set[str], set[str], str]:
@@ -1766,9 +1762,8 @@ def save_objects(
     
     # ===========================
     # all object post processing
-    # 1. convert numpy to python list
     # 2. map solid color face uv -> location in generated texture
-    # 3. disable faces with user specified disable texture
+    # 3. rewrite path textures -> texture name reference
     # ===========================
     def final_element_processing(element):
         # convert numpy to python list
@@ -1790,7 +1785,7 @@ def save_objects(
                 # glow
                 if f.glow > 0:
                     faces[d]["glow"] = f.glow
-            
+        
         for child in element["children"]:
             final_element_processing(child)
         
@@ -1819,7 +1814,6 @@ def save_objects(
         animations = save_all_animations(
             bone_hierarchy,
             rotate_shortest_distance=rotate_shortest_distance,
-            animation_version_0=animation_version_0,
         )
         if len(animations) > 0:
             model_json["animations"] = animations
