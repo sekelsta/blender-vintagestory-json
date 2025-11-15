@@ -479,8 +479,8 @@ class AnimationAdapter():
 
     def create_vintage_story_keyframes(self, bone_hierarchy):
         """Create list of keyframes for this action in VintageStory format.
-        Assume keyframes can have holes (not all x, y, z coords) and can be
-        either use euler or quaternion rotation.
+        Assume keyframes can have holes (not all x, y, z coords) and can
+        use either euler or quaternion rotation.
             loc.x   o---o---o---o---o
             loc.y   o-------o--------   <- holes
             loc.z   -----------------   <- does not exist, use default sampler

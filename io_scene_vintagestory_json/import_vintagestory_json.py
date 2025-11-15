@@ -499,6 +499,7 @@ def parse_animation(
     if "onActivityStopped" in e:
         marker = action.pose_markers.new(name="onActivityStopped_{}".format(e["onActivityStopped"]))
         marker.frame = num_frames + 20
+    action.frame_range = (0, num_frames - 1)
     
     # load keyframe data
     animation_adapter = animation.AnimationAdapter(action, name=name)
@@ -506,9 +507,9 @@ def parse_animation(
     # insert first keyframe at end to properly loop
     keyframes = e["keyframes"].copy()
     if repeat_animation and len(keyframes) > 0 and num_frames > 0:
-        # make copy of frame 0 and insert at num_frames-1
+        # make copy of frame 0 and insert at num_frames (one past the final frame)
         keyframe_0_copy = {
-            "frame": num_frames - 1,
+            "frame": num_frames,
             "elements": keyframes[0]["elements"],
         }
         keyframes.append(keyframe_0_copy)

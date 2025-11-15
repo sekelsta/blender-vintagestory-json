@@ -1249,7 +1249,7 @@ def save_all_animations(
 
         # action metadata
         action_name = action.name
-        quantity_frames = None
+        quantity_frames = action.frame_range[1] + 1 if action.use_frame_range else None
         on_activity_stopped = "EaseOut" # default
         on_animation_end = "Repeat"     # default
 
