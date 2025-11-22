@@ -472,7 +472,7 @@ class AnimationAdapter():
                     frame, _ = p.co
                     frames.add(int(frame))
 
-        frames = list(frames)
+        frames = [x for x in frames if x > self.action.frame_range[0] and x <= self.action.frame_range[1]]
         frames.sort()
         return frames
     
