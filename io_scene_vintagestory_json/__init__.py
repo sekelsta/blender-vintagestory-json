@@ -40,29 +40,6 @@ class ImportVintageStoryJson(Operator, ImportHelper):
         default=False,
     )
 
-    # applies default shift from vintagestory origin
-    do_translate_origin: BoolProperty(
-        name="Translate Origin",
-        description="Translate model origin after import",
-        default=True,
-    )
-    
-    translate_origin_x: FloatProperty(
-        name="Translate X",
-        description="X export offset (in Blender coordinates)",
-        default=-8.,
-    )
-    translate_origin_y: FloatProperty(
-        name="Translate Y",
-        description="Y export offset (in Blender coordinates)",
-        default=-8.,
-    )
-    translate_origin_z: FloatProperty(
-        name="Translate Z",
-        description="Z export offset (in Blender coordinates)",
-        default=0.,
-    )
-
     # import animations
     import_animations: BoolProperty(
         name="Import Animations",
@@ -72,14 +49,17 @@ class ImportVintageStoryJson(Operator, ImportHelper):
 
     def execute(self, context):
         args = self.as_keywords()
-        if args["do_translate_origin"] == True:
-            args["translate_origin"] = [
-                args["translate_origin_x"],
-                args["translate_origin_y"],
-                args["translate_origin_z"],
-            ]
-        else:
-            args["translate_origin"] = None
+        # Auto-compensate the Vintage Story block-space origin.
+        # VS models are commonly authored in [0..16] space with origin at the
+        # corner of the block. For Blender work (and mirror operations) it's
+        # much nicer if the imported model is centered around the origin.
+        #
+        # This is intentionally not exposed as a user-facing option.
+        args["translate_origin"] = [-8.0, -8.0, 0.0]
+
+        # Force single-material import workflow: we strip all materials and assign a shared 'skin' material
+        # in the importer post-process, so skip texture/material import entirely.
+        args["import_textures"] = False
 
         return import_vintagestory_json.load(context, **args)
 
@@ -91,14 +71,9 @@ def run_export(
     """Common internal function to run export and handle post export script.
     Re-usable for different export operators.
     """
-    if args.get("do_translate_origin", False):
-        args["translate_origin"] = [
-            args["translate_origin_x"],
-            args["translate_origin_y"],
-            args["translate_origin_z"],
-        ]
-    else:
-        args["translate_origin"] = None
+    # Undo the import-time origin compensation so exported JSON stays in the
+    # expected VS coordinate space. Intentionally not user-facing.
+    args["translate_origin"] = [8.0, 8.0, 0.0]
     
     # remap texture size overrides value 0 => None
     if "texture_size_x_override" in args:
@@ -170,29 +145,6 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         name="Skip Disabled Render",
         description="Skip objects with disabled render",
         default=True,
-    )
-
-    # applies default shift from vintagestory origin
-    do_translate_origin: BoolProperty(
-        name="Translate Origin",
-        description="Translate model origin after export",
-        default=True,
-    )
-    
-    translate_origin_x: FloatProperty(
-        name="Translate X",
-        description="X export offset (in Blender coordinates)",
-        default=8.,
-    )
-    translate_origin_y: FloatProperty(
-        name="Translate Y",
-        description="Y export offset (in Blender coordinates)",
-        default=8.,
-    )
-    translate_origin_z: FloatProperty(
-        name="Translate Z",
-        description="Z export offset (in Blender coordinates)",
-        default=0.,
     )
 
     # ================================
@@ -267,15 +219,9 @@ class ExportVintageStoryJson(Operator, ExportHelper):
 
     # ================================
     # animation options
-    export_armature: BoolProperty(
-        name="Export Armature",
-        description="Export by main armature tree",
-        default=True,
-    )
-
     export_animations: BoolProperty(
         name="Export Animations",
-        description="Export bone animations keyframes",
+        description="Export animations keyframes",
         default=True,
     )
 
@@ -285,22 +231,71 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         default=False,
     )
 
-    use_main_object_as_bone: BoolProperty(
-        name="Use Main Object as Bone",
-        description="Use main object with same transform as bone instead of dummy bone",
-        default=True,
+    rotate_shortest_distance: BoolProperty(
+        name="Shortest-Path Rotations",
+        description=(
+            "Improve in-game rotation interpolation for animations authored in quaternion mode by "
+            "(a) unwrapping Euler windings during export and (b) setting rotShortestDistance flags "
+            "on keyframes. Enable this when VSMC looks correct but the game takes the long way around."
+        ),
+        default=False,
     )
 
-    rotate_shortest_distance: BoolProperty(
-        name="Rotate Shortest Distance",
-        description="Use shortest distance interpolation for rotation keyframes",
+    bake_animations: BoolProperty(
+        name="Bake Animations",
+        description=(
+            "Resample/bake animations to one keyframe per frame (or per step). "
+            "This removes differences caused by cubic vs linear interpolation or quaternion->Euler ambiguity, "
+            "at the cost of a larger JSON file."
+        ),
         default=False,
     )
-    
-    animation_version_0: BoolProperty(
-        name="Use Animation Version 0",
-        description="Use old vintagestory animation format with incompatible transform order",
+
+    bake_step: IntProperty(
+        name="Bake Step",
+        description="When baking, emit a keyframe every N frames (1 = every frame)",
+        default=1,
+        min=1,
+        soft_min=1,
+        soft_max=8,
+    )
+
+    smart_bake_only: BoolProperty(
+        name="Bake Only What Needs Baking",
+        description=(
+            "Detect non-linear interpolation or quaternion-authored motion and bake only those bones/channels. "
+            "Keeps the rest as sparse keys to reduce JSON size while improving in-game parity."
+        ),
         default=False,
+    )
+
+    sanitize_keyframes: BoolProperty(
+        name="Keyframe Sanitizer",
+        description=(
+            "Post-process exported keyframes to improve engine stability: unwrap Euler angles per channel, "
+            "snap near-zero noise to 0, clamp extreme values, and report issues."
+        ),
+        default=False,
+    )
+
+    sanitize_epsilon: FloatProperty(
+        name="Sanitize Epsilon",
+        description="Values with absolute magnitude below this are snapped to 0 (helps jitter/noise)",
+        default=1e-4,
+        min=0.0,
+        soft_min=0.0,
+        soft_max=1e-2,
+        precision=6,
+    )
+
+    sanitize_rot_clamp_deg: FloatProperty(
+        name="Rotation Clamp (deg)",
+        description="Clamp exported rotation channels to +/- this many degrees (extreme values are likely broken)",
+        default=7200.0,
+        min=0.0,
+        soft_min=180.0,
+        soft_max=36000.0,
+        precision=1,
     )
 
     # ================================
@@ -309,6 +304,18 @@ class ExportVintageStoryJson(Operator, ExportHelper):
         name="Use Step Parent",
         description="Transform element relative to step parent (for attachments like clothes)",
         default=True,
+    )
+
+    # ================================
+    # hierarchy repair options
+    repair_hierarchy: BoolProperty(
+        name="Repair Hierarchy",
+        description=(
+            "Attempt to reconstruct a sensible VS element parent/child hierarchy when it was broken in Blender "
+            "(e.g. cleared parents, lost custom properties, or bone-parented rigs without stored vs_parent). "
+            "This can fix partial/non-inheriting animations in-game for edge-case files."
+        ),
+        default=False,
     )
 
     # ================================
@@ -337,10 +344,20 @@ class ExportVintageStoryJson(Operator, ExportHelper):
             if prop not in self.skip_save_props:
                 bpy.context.scene["vintagestory_export_" + prop] = val
         
+        # Do NOT filter to root objects.
+        # VS models imported by this addon are typically bone-parented, so filtering to roots
+        # would drop all cuboid elements and leave only the armature.
         if self.selection_only:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.selected_objects)
+            objs = list(bpy.context.selected_objects)
         else:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.scene.collection.all_objects[:])
+            objs = list(bpy.context.scene.collection.all_objects[:])
+
+        # Ensure any referenced armatures are included.
+        for o in list(objs):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in objs:
+                objs.append(p)
+        args["objects"] = objs
         return run_export(self, **args)
 
     def draw(self, context):
@@ -372,9 +389,14 @@ class ExportVintageStoryJsonQuick(bpy.types.Operator):
                 args[prop[20:]] = val
         
         if "selection_only" in args and args["selection_only"] == True:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.selected_objects)
+            objs = list(bpy.context.selected_objects)
         else:
-            args["objects"] = export_vintagestory_json.filter_root_objects(bpy.context.scene.collection.all_objects[:])
+            objs = list(bpy.context.scene.collection.all_objects[:])
+        for o in list(objs):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in objs:
+                objs.append(p)
+        args["objects"] = objs
 
         # get blender filepath
         # https://github.com/dfelinto/blender/blob/master/release/scripts/modules/bpy_extras/io_utils.py#L56
@@ -446,8 +468,13 @@ class ExportVintageStoryJsonCollection(bpy.types.Operator):
 
         args = {
             "filepath": save_filepath,
-            "objects": export_vintagestory_json.filter_root_objects(collection_to_export.all_objects),
+            "objects": list(collection_to_export.all_objects),
         }
+
+        for o in list(args["objects"]):
+            p = getattr(o, "parent", None)
+            if p is not None and p.type == "ARMATURE" and p not in args["objects"]:
+                args["objects"].append(p)
         
         # gather export args stored in scene
         for prop, val in bpy.context.scene.items():
@@ -505,7 +532,12 @@ class ExportVintageStoryJsonHighlightedCollections(bpy.types.Operator):
         for collection_to_export in highlighted_collections:
             # collection specific args, re-write for each collection
             args["filepath"] = os.path.join(save_dir, collection_to_export.name + ".json")
-            args["objects"] = export_vintagestory_json.filter_root_objects(collection_to_export.all_objects)
+            args["objects"] = list(collection_to_export.all_objects)
+
+            for o in list(args["objects"]):
+                p = getattr(o, "parent", None)
+                if p is not None and p.type == "ARMATURE" and p not in args["objects"]:
+                    args["objects"].append(p)
 
             run_export(self, **args)
 
@@ -536,10 +568,6 @@ class VINTAGESTORY_PT_export_geometry(bpy.types.Panel):
         layout.prop(operator, "selection_only")
         layout.prop(operator, "skip_disabled_render")
         layout.prop(operator, "use_step_parent")
-        layout.prop(operator, "do_translate_origin")
-        layout.prop(operator, "translate_origin_x")
-        layout.prop(operator, "translate_origin_y")
-        layout.prop(operator, "translate_origin_z")
 
 
 # export options panel for textures
@@ -618,12 +646,21 @@ class VINTAGESTORY_PT_export_animation(bpy.types.Panel):
         sfile = context.space_data
         operator = sfile.active_operator
 
-        layout.prop(operator, "export_armature")
         layout.prop(operator, "export_animations")
         layout.prop(operator, "generate_animations_file")
-        layout.prop(operator, "use_main_object_as_bone")
         layout.prop(operator, "rotate_shortest_distance")
-        layout.prop(operator, "animation_version_0")
+        layout.prop(operator, "bake_animations")
+        row = layout.row()
+        row.enabled = bool(getattr(operator, "bake_animations", False))
+        row.prop(operator, "bake_step")
+
+        layout.prop(operator, "smart_bake_only")
+        layout.separator()
+        layout.prop(operator, "sanitize_keyframes")
+        col = layout.column()
+        col.enabled = bool(getattr(operator, "sanitize_keyframes", False))
+        col.prop(operator, "sanitize_epsilon")
+        col.prop(operator, "sanitize_rot_clamp_deg")
 
 
 class VINTAGESTORY_PT_export_scripts(bpy.types.Panel):

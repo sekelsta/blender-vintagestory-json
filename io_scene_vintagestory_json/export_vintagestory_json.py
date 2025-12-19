@@ -4,9 +4,11 @@ from mathutils import Vector, Euler, Quaternion, Matrix
 from dataclasses import dataclass
 import math
 import numpy as np
+import bmesh
 import posixpath # need "/" separator
 import os
 import json
+import re
 from . import animation
 
 import importlib
@@ -392,10 +394,14 @@ def generate_mesh_element(
     parent_matrix_world=None,      # parent matrix world transform 
     parent_cube_origin=None,       # parent cube "from" origin (coords in VintageStory space)
     parent_rotation_origin=None,   # parent object rotation origin (coords in VintageStory space)
+    # Some callers (export tree rebuild) pass this flag through generate_element.
+    # Mesh elements handle children outside this function, so we ignore it here.
+    skip_children_recurse=False,
     export_uvs=True,               # export uvs
     export_generated_texture=True,
     texture_size_x_override=None,  # override texture size x
     texture_size_y_override=None,  # override texture size y
+    **_ignored_kwargs,
 ):
     """Recursive function to generate output element from
     Blender object
@@ -429,12 +435,18 @@ def generate_mesh_element(
     -> if this is part of an armature, must get relative
     to parent bone
     """
-    origin = obj.location.copy()
+        # Use world-space transform instead of obj.location/rotation_euler.
+    # Bone-parenting stores obj.location in bone space which breaks roundtrip centering.
+    matrix_world = obj.matrix_world.copy()
+    origin = matrix_world.translation.copy()
     bone_location = None
     bone_origin = None
-    obj_rotation = obj.rotation_euler.copy()
+    try:
+        obj_rotation = matrix_world.to_quaternion().to_euler("XYZ")
+    except Exception:
+        obj_rotation = obj.rotation_euler.copy()
     origin_bone_offset = np.array([0., 0., 0.])
-    matrix_world = obj.matrix_world.copy()
+    is_main_bone_mesh = False
 
     if armature is not None and obj.parent is not None and obj.parent_bone != "":
         bone_name = obj.parent_bone
@@ -448,7 +460,8 @@ def generate_mesh_element(
                 bone_location = bone.head_local
             
             bone_origin = bone.head_local
-            origin_bone_offset = origin - bone.head_local
+            is_main_bone_mesh = True
+            origin_bone_offset = np.array([0., 0., 0.])
             matrix_world.translation = bone.head_local
     
     # use step parent bone if available
@@ -558,176 +571,282 @@ def generate_mesh_element(
         "up": {"texture": "#0", "uv": [0, 0, 4, 4], "autoUv": False},
         "down": {"texture": "#0", "uv": [0, 0, 4, 4], "autoUv": False},
     }
+
+    # Robust UV access for Blender 4.x+.
+    # In Blender 4.x/4.5, UVs may be backed by mesh.attributes (CORNER/FLOAT2)
+    # and mesh.uv_layers.active.data can sometimes be empty (len==0).
+    uv_layer = None               # classic UVLoop data (preferred)
+    uv_attr = None                # mesh.attributes fallback
+    bm = None                     # last-resort fallback
+    bm_uv = None
+    bm_faces_by_poly_index = None
+    uv_name = None
+
+    if export_uvs:
+        # 1) Try classic uv_layers.active.data
+        try:
+            uvl = mesh.uv_layers.active
+            if uvl is not None:
+                uv_name = uvl.name
+                if uvl.data is not None and len(uvl.data) == len(mesh.loops):
+                    uv_layer = uvl.data
+        except Exception:
+            uv_layer = None
+
+        # 2) Try attributes-based UVs (Blender 4.x)
+        if uv_layer is None:
+            try:
+                if uv_name is None and getattr(mesh, "uv_layers", None) and mesh.uv_layers.active is not None:
+                    uv_name = mesh.uv_layers.active.name
+                attr = mesh.attributes.get(uv_name) if uv_name else None
+                if attr is not None and getattr(attr, "domain", None) == 'CORNER' and len(attr.data) == len(mesh.loops):
+                    uv_attr = attr
+            except Exception:
+                uv_attr = None
+
+        # 3) Last resort: bmesh loop UV layer
+        if uv_layer is None and uv_attr is None:
+            try:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                bm.faces.ensure_lookup_table()
+                bm_uv = bm.loops.layers.uv.active
+                if bm_uv is None:
+                    export_uvs = False
+                    bm.free()
+                    bm = None
+                    bm_uv = None
+                else:
+                    # Keep a direct index lookup only if face counts match.
+                    if len(bm.faces) == len(mesh.polygons):
+                        bm_faces_by_poly_index = bm.faces
+            except Exception:
+                export_uvs = False
+                if bm is not None:
+                    bm.free()
+                bm = None
+                bm_uv = None
+                bm_faces_by_poly_index = None
+
+
     
-    uv_layer = mesh.uv_layers.active.data
+    # Group polygons by direction so triangulated or subdivided cube faces
+    # still export correctly. (Some Blender ops keep 8 verts but increase poly count.)
+    dir_polys = {k: [] for k in faces.keys()}
 
-    for i, face in enumerate(mesh.polygons):
-        if i > 5: # should be 6 faces only
-            print(f"WARNING: {obj} has >6 faces")
-            break
-
-        # stack + reshape to (6,3)
-        face_normal = np.array(face.normal)
-        face_normal_stacked = np.transpose(face_normal[..., np.newaxis], (1,0))
-        face_normal_stacked = np.tile(face_normal_stacked, (6,1))
-
-        # get face direction string
+    for poly in mesh.polygons:
+        face_normal = np.array(poly.normal)
+        face_normal_stacked = np.tile(face_normal, (6, 1))
         face_direction_index = np.argmax(np.sum(face_normal_stacked * DIRECTION_NORMALS, axis=1), axis=0)
         d = DIRECTIONS[face_direction_index]
-        
+        if d in dir_polys:
+            dir_polys[d].append(poly.index)
+
+    def _corner_index(x, y, minx, maxx, miny, maxy, eps=1e-6):
+        # 0=bottom-left, 1=bottom-right, 2=top-right, 3=top-left
+        # Use distance-to-extremes instead of strict comparisons to avoid float jitter.
+        left = abs(x - minx) <= abs(x - maxx) + eps
+        bottom = abs(y - miny) <= abs(y - maxy) + eps
+        if bottom and left:
+            return 0
+        if bottom and not left:
+            return 1
+        if (not bottom) and (not left):
+            return 2
+        return 3
+
+    def _project_vert_2d(v, face_normal):
+        # v is a length-3 numpy-like (x,y,z). Returns (px,py) in the face plane.
+        if face_normal[0] > 0.5:      # normal = (1, 0, 0)
+            return (v[1], v[2])
+        if face_normal[0] < -0.5:     # normal = (-1, 0, 0)
+            return (-v[1], v[2])
+        if face_normal[1] > 0.5:      # normal = (0, 1, 0)
+            return (-v[0], v[2])
+        if face_normal[1] < -0.5:     # normal = (0, -1, 0)
+            return (v[0], v[2])
+        if face_normal[2] > 0.5:      # normal = (0, 0, 1)
+            return (v[1], -v[0])
+        # face_normal[2] < -0.5       # normal = (0, 0, -1)
+        return (v[1], v[0])
+
+    for d, poly_indices in dir_polys.items():
+        if not poly_indices:
+            continue
+
+        # Representative polygon: largest area for stable winding/loop start.
+        rep_poly = max((mesh.polygons[i] for i in poly_indices), key=lambda p: p.area)
+        rep_normal = np.array(rep_poly.normal)
+
         face_material = FaceMaterial.from_face(
             obj,
-            face.material_index,
+            rep_poly.material_index,
         )
-        
+
         # disabled face
         if face_material.type == FaceMaterial.DISABLE:
             faces[d]["texture"] = "#" + face_material.name
             faces[d]["enabled"] = False
+            continue
         # solid color tuple
-        elif face_material.type == FaceMaterial.COLOR and export_generated_texture:
-            faces[d] = face_material # replace face with face material, will convert later
+        if face_material.type == FaceMaterial.COLOR and export_generated_texture:
+            faces[d] = face_material  # replace face with face material, will convert later
             if model_colors is not None:
                 model_colors.add(face_material.color)
+            continue
         # texture
-        elif face_material.type == FaceMaterial.TEXTURE:
-            faces[d]["texture"] = "#" + face_material.name
-            model_textures[face_material.name] = face_material
+        if face_material.type != FaceMaterial.TEXTURE:
+            continue
 
-            # face glow
-            if face_material.glow > 0:
-                faces[d]["glow"] = face_material.glow
+        faces[d]["texture"] = "#" + face_material.name
+        model_textures[face_material.name] = face_material
 
-            tex_width = face_material.texture_size[0] if texture_size_x_override is None else texture_size_x_override
-            tex_height = face_material.texture_size[1] if texture_size_y_override is None else texture_size_y_override
+        # face glow
+        if face_material.glow > 0:
+            faces[d]["glow"] = face_material.glow
 
-            if export_uvs:
-                # uv loop
-                loop_start = face.loop_start
-                face_uv_0 = uv_layer[loop_start].uv
-                face_uv_1 = uv_layer[loop_start+1].uv
-                face_uv_2 = uv_layer[loop_start+2].uv
-                face_uv_3 = uv_layer[loop_start+3].uv
+        tex_width = face_material.texture_size[0] if texture_size_x_override is None else texture_size_x_override
+        tex_height = face_material.texture_size[1] if texture_size_y_override is None else texture_size_y_override
 
-                uv_min_x = min(face_uv_0[0], face_uv_2[0])
-                uv_max_x = max(face_uv_0[0], face_uv_2[0])
-                uv_min_y = min(face_uv_0[1], face_uv_2[1])
-                uv_max_y = max(face_uv_0[1], face_uv_2[1])
+        if not export_uvs:
+            continue
 
-                uv_clockwise = loop_is_clockwise([face_uv_0, face_uv_1, face_uv_2, face_uv_3])
+        # Collect UV + projected-vert samples across all polys in this direction to get a robust bbox.
+        uv_samples = []
+        vert2d_samples = []
 
-                # vertices loops
-                # project 3d vertex loop onto 2d loop based on face normal,
-                # minecraft uv mapping starting corner experimentally determined
-                verts = [ v_local[:,v] for v in face.vertices ]
-                
-                if face_normal[0] > 0.5: # normal = (1, 0, 0)
-                    verts = [ (v[1], v[2]) for v in verts ]
-                elif face_normal[0] < -0.5: # normal = (-1, 0, 0)
-                    verts = [ (-v[1], v[2]) for v in verts ]
-                elif face_normal[1] > 0.5: # normal = (0, 1, 0)
-                    verts = [ (-v[0], v[2]) for v in verts ]
-                elif face_normal[1] < -0.5: # normal = (0, -1, 0)
-                    verts = [ (v[0], v[2]) for v in verts ]
-                elif face_normal[2] > 0.5: # normal = (0, 0, 1)
-                    verts = [ (v[1], -v [0]) for v in verts ]
-                elif face_normal[2] < -0.5: # normal = (0, 0, -1)
-                    verts = [ (v[1], v[0]) for v in verts ]
-                
-                vert_min_x = min(verts[0][0], verts[2][0])
-                vert_max_x = max(verts[0][0], verts[2][0])
-                vert_min_y = min(verts[0][1], verts[2][1])
-                vert_max_y = max(verts[0][1], verts[2][1])
+        # Also collect loop sequence for the representative poly (for rotation inference).
+        rep_uvs = []
+        rep_verts2d = []
 
-                vert_clockwise = loop_is_clockwise(verts)
-                
-                # get uv, vert loop starting corner index 0..3 in face loop
+        for pi in poly_indices:
+            poly = mesh.polygons[pi]
+            loop_start = poly.loop_start
+            loop_total = poly.loop_total
 
-                # uv start corner index
-                uv_start_x = face_uv_0[0]
-                uv_start_y = face_uv_0[1]
-                if uv_start_y < uv_max_y:
-                    # start coord 0
-                    if uv_start_x < uv_max_x:
-                        uv_loop_start_index = 0
-                    # start coord 1
+            # bmesh face (only if we constructed bm and uv layer exists there)
+            bm_face = None
+            if bm_faces_by_poly_index is not None and bm_uv is not None:
+                try:
+                    bm_face = bm_faces_by_poly_index[pi]
+                except Exception:
+                    bm_face = None
+
+            for li in range(loop_total):
+                # UV (prefer uv_layers, then attributes, then bmesh)
+                if uv_layer is not None:
+                    luv = uv_layer[loop_start + li].uv
+                    u, v = float(luv[0]), float(luv[1])
+                elif uv_attr is not None:
+                    a = uv_attr.data[loop_start + li]
+                    # Blender attribute API varies: try vector/uv/value
+                    if hasattr(a, "vector"):
+                        luv = a.vector
+                    elif hasattr(a, "uv"):
+                        luv = a.uv
                     else:
-                        uv_loop_start_index = 1
+                        luv = a.value
+                    u, v = float(luv[0]), float(luv[1])
+                elif bm_face is not None:
+                    luv = bm_face.loops[li][bm_uv].uv
+                    u, v = float(luv[0]), float(luv[1])
                 else:
-                    # start coord 2
-                    if uv_start_x > uv_min_x:
-                        uv_loop_start_index = 2
-                    # start coord 3
-                    else:
-                        uv_loop_start_index = 3
-                
-                # vert start corner index
-                vert_start_x = verts[0][0]
-                vert_start_y = verts[0][1]
-                if vert_start_y < vert_max_y:
-                    # start coord 0
-                    if vert_start_x < vert_max_x:
-                        vert_loop_start_index = 0
-                    # start coord 1
-                    else:
-                        vert_loop_start_index = 1
-                else:
-                    # start coord 2
-                    if vert_start_x > vert_min_x:
-                        vert_loop_start_index = 2
-                    # start coord 3
-                    else:
-                        vert_loop_start_index = 3
+                    # no UVs available
+                    continue
 
-                # set uv flip and rotation based on
-                # 1. clockwise vs counterclockwise loop
-                # 2. relative starting corner difference between vertex loop and uv loop
-                # NOTE: if face normals correct, vertices should always be counterclockwise...
-                face_uvs = np.zeros((4,))
+                uv_samples.append((u, v))
 
-                if uv_clockwise == False and vert_clockwise == False:
-                    face_uvs[0] = uv_min_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_max_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                elif uv_clockwise == True and vert_clockwise == False:
-                    # invert x face uvs
-                    face_uvs[0] = uv_max_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_min_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                elif uv_clockwise == False and vert_clockwise == True:
-                    # invert y face uvs, case should not happen
-                    face_uvs[0] = uv_max_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_min_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
-                else: # uv_clockwise == True and vert_clockwise == True:
-                    # case should not happen
-                    face_uvs[0] = uv_min_x
-                    face_uvs[1] = uv_max_y
-                    face_uvs[2] = uv_max_x
-                    face_uvs[3] = uv_min_y
-                    face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+                # Vertex -> 2D in face plane
+                vidx = mesh.loops[loop_start + li].vertex_index
+                v3 = v_local[:, vidx]
+                p2 = _project_vert_2d(v3, rep_normal)
+                vert2d_samples.append((float(p2[0]), float(p2[1])))
 
-                xmin = face_uvs[0] * tex_width
-                ymin = (1.0 - face_uvs[1]) * tex_height
-                xmax = face_uvs[2] * tex_width
-                ymax = (1.0 - face_uvs[3]) * tex_height
+                # Representative poly sequences
+                if pi == rep_poly.index:
+                    rep_uvs.append((u, v))
+                    rep_verts2d.append((float(p2[0]), float(p2[1])))
 
-                # wtf? down different?
-                if d == "down":
-                    xmin, xmax = xmax, xmin
-                    ymin, ymax = ymax, ymin
-                    
-                faces[d]["uv"] = [ xmin, ymin, xmax, ymax ]
-                
-                if face_uv_rotation != 0 and face_uv_rotation != 360:
-                    faces[d]["rotation"] = face_uv_rotation if face_uv_rotation >= 0 else 360 + face_uv_rotation
-    
+        if not uv_samples or not rep_uvs:
+            continue
+
+        uv_min_x = min(u for u, _ in uv_samples)
+        uv_max_x = max(u for u, _ in uv_samples)
+        uv_min_y = min(v for _, v in uv_samples)
+        uv_max_y = max(v for _, v in uv_samples)
+
+        vert_min_x = min(x for x, _ in vert2d_samples)
+        vert_max_x = max(x for x, _ in vert2d_samples)
+        vert_min_y = min(y for _, y in vert2d_samples)
+        vert_max_y = max(y for _, y in vert2d_samples)
+
+        # If representative poly isn't a quad, bbox export is still fine but
+        # rotation inference becomes unreliable. Fall back to no rotation.
+        if rep_poly.loop_total != 4 or len(rep_uvs) < 4 or len(rep_verts2d) < 4:
+            face_uvs = np.array([uv_min_x, uv_max_y, uv_max_x, uv_min_y], dtype=float)
+            face_uv_rotation = 0
+        else:
+            uv_clockwise = loop_is_clockwise(rep_uvs)
+            vert_clockwise = loop_is_clockwise(rep_verts2d)
+
+            # Determine start-corner indices using bbox corners with tolerance.
+            uv_loop_start_index = _corner_index(rep_uvs[0][0], rep_uvs[0][1], uv_min_x, uv_max_x, uv_min_y, uv_max_y)
+            vert_loop_start_index = _corner_index(rep_verts2d[0][0], rep_verts2d[0][1], vert_min_x, vert_max_x, vert_min_y, vert_max_y)
+
+            face_uvs = np.zeros((4,), dtype=float)
+
+            if (not uv_clockwise) and (not vert_clockwise):
+                # TL-BR rectangle in UV space (y handled later)
+                face_uvs[0] = uv_min_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_max_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            elif uv_clockwise and (not vert_clockwise):
+                # mirrored in U, then rotate
+                face_uvs[0] = uv_max_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_min_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            elif (not uv_clockwise) and vert_clockwise:
+                # rare, but keep consistent with previous fallback behavior
+                face_uvs[0] = uv_max_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_min_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = CLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+            else:
+                face_uvs[0] = uv_min_x
+                face_uvs[1] = uv_max_y
+                face_uvs[2] = uv_max_x
+                face_uvs[3] = uv_min_y
+                face_uv_rotation = COUNTERCLOCKWISE_UV_ROTATION_LOOKUP[uv_loop_start_index][vert_loop_start_index]
+
+        xmin = face_uvs[0] * tex_width
+        ymin = (1.0 - face_uvs[1]) * tex_height
+        xmax = face_uvs[2] * tex_width
+        ymax = (1.0 - face_uvs[3]) * tex_height
+
+        # "down" orientation quirk preserved from original exporter
+        if d == "down":
+            xmin, xmax = xmax, xmin
+            ymin, ymax = ymax, ymin
+
+        faces[d]["uv"] = [xmin, ymin, xmax, ymax]
+
+        if face_uv_rotation != 0 and face_uv_rotation != 360:
+            faces[d]["rotation"] = face_uv_rotation if face_uv_rotation >= 0 else 360 + face_uv_rotation
+
+
+    # free bmesh if we used it for UV reads
+    if bm is not None:
+        try:
+            bm.free()
+        except Exception:
+            pass
+
+
     # ================================
     # build children
     # ================================
@@ -735,63 +854,17 @@ def generate_mesh_element(
     attachpoints = []
     
     # parse direct children objects normally
-    for child in obj.children:
-        if skip_disabled_render and child.hide_render:
-            continue
-
-        child_element = generate_element(
-            child,
-            skip_disabled_render=skip_disabled_render,
-            parent=obj,
-            armature=None,
-            bone_hierarchy=None,
-            groups=groups,
-            model_colors=model_colors,
-            model_textures=model_textures,
-            parent_matrix_world=matrix_world,
-            parent_cube_origin=cube_origin,
-            parent_rotation_origin=rotation_origin,
-            export_uvs=export_uvs,
-            texture_size_x_override=texture_size_x_override,
-            texture_size_y_override=texture_size_y_override,
-        )
-        if child_element is not None:
-            if child.name.startswith("attach_"):
-                attachpoints.append(child_element)
-            else:
-                children.append(child_element)
-
-    # use parent bone children if this is part of an armature
-    if bone_hierarchy is not None and obj.parent is not None and obj.parent_type == "ARMATURE":
-        bone_obj_children = []
-        parent_bone_name = obj.parent_bone
-        if parent_bone_name != "" and parent_bone_name in bone_hierarchy and parent_bone_name in armature.data.bones:
-            # if this is main bone, parent other objects to this
-            if bone_hierarchy[parent_bone_name].main.name == obj.name:
-                # rename this object to the bone name
-                obj_name = parent_bone_name
-
-                # parent other objects in same bone to this object
-                if len(bone_hierarchy[parent_bone_name].children) > 1:
-                    bone_obj_children.extend(bone_hierarchy[parent_bone_name].children[1:])
-                
-                # parent children main objects to this
-                parent_bone = armature.data.bones[parent_bone_name]
-                for child_bone in parent_bone.children:
-                    child_bone_name = child_bone.name
-                    if child_bone_name in bone_hierarchy:
-                        bone_obj_children.append(bone_hierarchy[child_bone_name].main)
-    
-        for child in bone_obj_children:
+    if not skip_children_recurse:
+        for child in obj.children:
             if skip_disabled_render and child.hide_render:
                 continue
-            
+
             child_element = generate_element(
                 child,
                 skip_disabled_render=skip_disabled_render,
                 parent=obj,
-                armature=armature,
-                bone_hierarchy=bone_hierarchy,
+                armature=None,
+                bone_hierarchy=None,
                 groups=groups,
                 model_colors=model_colors,
                 model_textures=model_textures,
@@ -808,12 +881,82 @@ def generate_mesh_element(
                 else:
                     children.append(child_element)
 
+    # use parent bone children if this is part of an armature
+    if not skip_children_recurse:
+        if bone_hierarchy is not None and obj.parent is not None and obj.parent_type == "ARMATURE":
+            bone_obj_children = []
+            parent_bone_name = obj.parent_bone
+            if parent_bone_name != "" and parent_bone_name in bone_hierarchy and parent_bone_name in armature.data.bones:
+                # if this is main bone, parent other objects to this
+                if bone_hierarchy[parent_bone_name].main.name == obj.name:
+                    # Keep exported element names based on the current object name.
+                    # Bone names are used internally for hierarchy and animation sampling;
+                    # we map them to export names separately during export.
+
+                    # parent other objects in same bone to this object
+                    if len(bone_hierarchy[parent_bone_name].children) > 1:
+                        bone_obj_children.extend(bone_hierarchy[parent_bone_name].children[1:])
+                
+                    # parent children main objects to this
+                    parent_bone = armature.data.bones[parent_bone_name]
+                    for child_bone in parent_bone.children:
+                        child_bone_name = child_bone.name
+                        if child_bone_name in bone_hierarchy:
+                            bone_obj_children.append(bone_hierarchy[child_bone_name].main)
+    
+            for child in bone_obj_children:
+                if skip_disabled_render and child.hide_render:
+                    continue
+            
+                child_element = generate_element(
+                    child,
+                    skip_disabled_render=skip_disabled_render,
+                    parent=obj,
+                    armature=armature,
+                    bone_hierarchy=bone_hierarchy,
+                    groups=groups,
+                    model_colors=model_colors,
+                    model_textures=model_textures,
+                    parent_matrix_world=matrix_world,
+                    parent_cube_origin=cube_origin,
+                    parent_rotation_origin=rotation_origin,
+                    export_uvs=export_uvs,
+                    texture_size_x_override=texture_size_x_override,
+                    texture_size_y_override=texture_size_y_override,
+                )
+                if child_element is not None:
+                    if child.name.startswith("attach_"):
+                        attachpoints.append(child_element)
+                    else:
+                        children.append(child_element)
+
     # ================================
     # build element
     # ================================
+    # ------------------------------------------------
+    # Choose the name to write into VS JSON.
+    #
+    # Importer stores the original VS name in obj["vs_name"] to preserve whitespace,
+    # but we must respect user renames in Blender.
+    #
+    # Priority:
+    #   1) obj["rename"] override (explicit)
+    #   2) if user did NOT rename since import: use original VS name (obj["vs_name"]) to preserve whitespace
+    #   3) otherwise: use current Blender object name (obj_name)
+    # ------------------------------------------------
     export_name = obj_name
-    if "rename" in obj and isinstance(obj["rename"], str):
+
+    # Explicit override
+    if "rename" in obj and isinstance(obj["rename"], str) and obj["rename"].strip():
         export_name = obj["rename"]
+    else:
+        vs_name = obj.get("vs_name") if hasattr(obj, "get") else None
+        import_blender_name = obj.get("vs_import_blender_name") if hasattr(obj, "get") else None
+        try:
+            if isinstance(vs_name, str) and isinstance(import_blender_name, str) and obj.name == import_blender_name:
+                export_name = vs_name
+        except Exception:
+            pass
     
     new_element = {
         "name": export_name,
@@ -859,6 +1002,7 @@ def generate_attach_point(
     parent_matrix_world=None,      # parent matrix world transform
     parent_cube_origin=None,       # parent cube "from" origin (coords in VintageStory space)
     parent_rotation_origin=None,   # parent object rotation origin (coords in VintageStory space)
+    skip_children_recurse=False,   # if True, do not recurse Blender children/bone children
     **kwargs,
 ):
     """Parse an attachment point
@@ -1219,114 +1363,518 @@ ROTATION_MODE_TO_FCURVE_PROPERTY = {
 }
 
 def save_all_animations(
-    bone_hierarchy,
-    rotate_shortest_distance=True, # shortest distance rotation interpolation
-    animation_version_0=False, # use old vintagestory animation version 0
+    obj_armature,
+    export_objects=None,
+    rotate_shortest_distance=False,
+    smart_bake_only=False,
+    bake_animations=False,
+    bake_step=1,
+    tol_loc=1e-4,
+    tol_rot_deg=1e-3,
 ):
-    """Save all animation actions in Blender file
+    """Export Vintage Story animations from a Blender Armature.
+
+    Key idea: Vintage Story animates *element groups* (the hierarchy nodes, analogous to bones),
+    not every child cube. Exporting per-cube tracks causes double-transforms in VSMC (the
+    "spiderweb hair" effect). Therefore we export tracks for Armature pose bones.
+
+    - Sample only real keyed frames (plus start/end).
+    - Convert pose-bone delta-from-rest into VS axis conventions.
+    - Do NOT export scale/stretch channels.
     """
     animations = []
-
-    if len(bpy.data.armatures) == 0:
+    if obj_armature is None or obj_armature.type != "ARMATURE":
         return animations
-    
-    # get armature, assume single armature
-    armature = bpy.data.armatures[0]
+
+    scene = bpy.context.scene
+    arm_data = obj_armature.data
+
+    # Save/restore state
+    orig_frame = scene.frame_current
+    orig_pose_pos = getattr(arm_data, "pose_position", "POSE")
+    orig_action = obj_armature.animation_data.action if obj_armature.animation_data else None
+
+    if obj_armature.animation_data is None:
+        obj_armature.animation_data_create()
+
+    def near_zero(x, tol):
+        try:
+            return abs(float(x)) <= tol
+        except Exception:
+            return True
+
+    def safe_f(x):
+        try:
+            x = float(x)
+            if not math.isfinite(x):
+                return 0.0
+            return x
+        except Exception:
+            return 0.0
+
+    def extract_bone_from_datapath(dp: str):
+        """Extract the PoseBone name from an Action FCurve data_path.
+
+        Blender versions differ in how they quote bone names in data paths:
+        - pose.bones["Bone"]...
+        - pose.bones['Bone']...
+
+        If we fail to parse this, animation export silently becomes empty.
+        """
+        dp = dp or ""
+        # Accept both single and double quotes, with optional whitespace.
+        m = re.search(r"pose\.bones\[\s*['\"]([^'\"]+)['\"]\s*\]", dp)
+        return m.group(1) if m else None
+
+    def bone_export_name(bone):
+        """Resolve the name to emit for animation tracks.
+
+        Priority:
+        1) bone["vs_export_name"] if present (set during model export to follow user renames)
+        2) original VS name (bone["vs_name"]) only if the bone hasn't been renamed since import
+        3) current Blender bone.name
+        """
+        try:
+            v = bone.get("vs_export_name", "")
+            if isinstance(v, str) and v.strip():
+                return v
+        except Exception:
+            pass
+
+        try:
+            vs_name = bone.get("vs_name", "")
+            imp = bone.get("vs_import_blender_name", "")
+            if isinstance(vs_name, str) and vs_name.strip() and isinstance(imp, str) and imp and bone.name == imp:
+                return vs_name
+        except Exception:
+            pass
+
+        return bone.name
+
     try:
-        obj_armature = bpy.data.objects[armature.name]
-    except Exception as err:
-        print("Error finding armature:", err)
-        return animations
-    bones = obj_armature.pose.bones
+        arm_data.pose_position = "POSE"
+    except Exception:
+        pass
 
-    for action in bpy.data.actions:
-        # get all actions
-        fcurves = action.fcurves
-        
-        # skip empty actions
-        if len(fcurves) == 0:
+    # Mute NLA tracks during sampling so only the current action is evaluated
+    ad = obj_armature.animation_data
+    orig_nla_mute = []
+    try:
+        if ad and getattr(ad, "nla_tracks", None):
+            for tr in ad.nla_tracks:
+                orig_nla_mute.append((tr, tr.mute))
+                tr.mute = True
+    except Exception:
+        orig_nla_mute = []
+
+    def actions_touching_armature():
+        out = []
+        for a in bpy.data.actions:
+            fcurves = getattr(a, "fcurves", None)
+            if not fcurves:
+                continue
+            for fcu in fcurves:
+                bname = extract_bone_from_datapath(getattr(fcu, "data_path", ""))
+                if bname and arm_data.bones.get(bname) is not None:
+                    out.append(a)
+                    break
+        out.sort(key=lambda x: x.name.lower())
+        return out
+
+    def gather_used_actions():
+        acts = []
+        if ad:
+            if ad.action:
+                acts.append(ad.action)
+            for tr in getattr(ad, "nla_tracks", []) or []:
+                for st in getattr(tr, "strips", []) or []:
+                    if st.action:
+                        acts.append(st.action)
+        seen = set()
+        out = []
+        for a in acts:
+            if a and a.name not in seen:
+                out.append(a)
+                seen.add(a.name)
+        return out
+
+    # Export any action that actually drives this armature.
+    # "Used" actions (active + NLA strips) are included, but we also include
+    # newly-created actions that are not yet on the NLA stack, as long as they
+    # have fcurves targeting this armature's pose bones.
+    _acts = []
+    _acts.extend(gather_used_actions())
+    _acts.extend(actions_touching_armature())
+    # de-duplicate while preserving order
+    actions_to_export = []
+    _seen = set()
+    for a in _acts:
+        if a is None:
+            continue
+        if a.name in _seen:
+            continue
+        actions_to_export.append(a)
+        _seen.add(a.name)
+
+    for action in actions_to_export:
+        # only consider actions that actually touch pose bones
+        fcurves = getattr(action, "fcurves", None)
+        if not fcurves:
             continue
 
-        # action metadata
-        action_name = action.name
-        on_activity_stopped = "PlayTillEnd" # default
-        on_animation_end = "EaseOut" # default
+        keyed_bones = set()
+        keyed_frames = set()
 
-        # parse metadata from action
-        if "on_activity_stopped" in action:
-            on_activity_stopped = action["on_activity_stopped"]
-        if "on_animation_end" in action:
-            on_animation_end = action["on_animation_end"]
-        
-        # load keyframe data
-        animation_adapter = animation.AnimationAdapter(
-            action=action,
-            name=action_name,
-            armature=armature,
-            rotate_shortest_distance=rotate_shortest_distance,
-            animation_version_0=animation_version_0,
-        )
-
-        # TODO: bake IKs?
-        # https://github.com/blender/blender/blob/main/scripts/modules/bpy_extras/anim_utils.py#L164
-
-        # sort fcurves by bone
         for fcu in fcurves:
-            # read bone name in format: path.bones["name"].property
-            fcu_data_path = fcu.data_path
-            if not fcu_data_path.startswith("pose.bones"):
-                continue
-            
-            # read bone name
-            idx_bone_name_start = 12                    # [" index
-            idx_bone_name_end = fcu_data_path.find("]", 12) # "] index
-            bone_name = fcu_data_path[idx_bone_name_start:idx_bone_name_end-1]
+            bname = extract_bone_from_datapath(getattr(fcu, "data_path", ""))
+            if bname:
+                keyed_bones.add(bname)
+                for kp in getattr(fcu, "keyframe_points", []):
+                    try:
+                        keyed_frames.add(int(round(kp.co[0])))
+                    except Exception:
+                        pass
 
-            # skip if bone not found
-            if bone_name not in bones:
-                print(f"WARN: bone {bone_name} not found in armature")
-                continue
-            
-            bone = bones[bone_name]
-            rotation_mode = bone.rotation_mode
+        if not keyed_bones:
+            continue
 
-            # match data_path property to export name
-            property_name = fcu_data_path[idx_bone_name_end+2:]
+        # Determine sampling bounds
+        fr0, fr1 = action.frame_range
+        start = int(round(fr0))
+        end = int(round(fr1))
+        if end < start:
+            start, end = end, start
 
-            # bone can have both euler and quaternion fcurves, so need to
-            # make sure this rotation curve matches the bone rotation mode
-            # being used...
-            # e.g. bone with XYZ euler mode should only use "rotation_euler" fcurve
-            #      since rotation_quaternion fcurves can still exist
-            if property_name == "rotation_euler" or property_name == "rotation_quaternion":
-                if ROTATION_MODE_TO_FCURVE_PROPERTY[rotation_mode] != property_name:
+        # Decide which bones/channels need baking (cubic curves, modifiers, quaternion auth).
+        # When smart_bake_only is enabled we will bake only those bones, keeping others sparse.
+        step = 1
+        try:
+            step = int(bake_step)
+        except Exception:
+            step = 1
+        if step <= 0:
+            step = 1
+
+        baked_frames = list(range(start, end + 1, step))
+        if baked_frames and baked_frames[-1] != end:
+            baked_frames.append(end)
+
+        sparse_frames = {start, end}
+        for f in keyed_frames:
+            if start <= f <= end:
+                sparse_frames.add(int(f))
+        sparse_frames = sorted(sparse_frames)
+
+        # Per-bone frame emission plan (used for "bake only what needs baking").
+        # Keyframes in VS can omit elements, so we can keep non-problematic bones sparse
+        # while baking only the ones that need parity with Blender's cubic/quaternion motion.
+        frames_for_bone = {}
+        if bake_animations:
+            frames = baked_frames
+            for b in keyed_bones:
+                frames_for_bone[b] = set(frames)
+        elif smart_bake_only:
+            needs_bake = {b: False for b in keyed_bones}
+            for fcu in fcurves:
+                dp = getattr(fcu, "data_path", "") or ""
+                bname = extract_bone_from_datapath(dp)
+                if not bname or bname not in needs_bake:
                     continue
 
-            # add bone and fcurve to animation adapter
-            animation_adapter.set_bone_rotation_mode(bone_name, ROTATION_MODE_TO_FCURVE_PROPERTY[rotation_mode])
-            animation_adapter.add_fcurve(fcu, fcu_data_path, fcu.array_index)
+                # Any non-linear interpolation, any modifiers, or quaternion-authored curves
+                # get baked to avoid engine interpolation mismatches.
+                try:
+                    if getattr(fcu, "modifiers", None) and len(fcu.modifiers) > 0:
+                        needs_bake[bname] = True
+                except Exception:
+                    pass
 
-        # convert from Blender bone format to Vintage story format
-        keyframes = animation_adapter.create_vintage_story_keyframes(bone_hierarchy)
-        
-        # set frame count to last keyframe + 1 (starts at 0)
-        if len(keyframes) > 0:
-            quantity_frames = int(keyframes[-1]["frame"]) + 1
+                if ".rotation_quaternion" in dp:
+                    needs_bake[bname] = True
+
+                try:
+                    for kp in getattr(fcu, "keyframe_points", []) or []:
+                        interp = getattr(kp, "interpolation", "LINEAR")
+                        if interp not in {"LINEAR", "CONSTANT"}:
+                            needs_bake[bname] = True
+                            break
+                except Exception:
+                    pass
+
+            all_frames = set()
+            for b in keyed_bones:
+                use_baked = needs_bake.get(b, False)
+                bf = baked_frames if use_baked else sparse_frames
+                frames_for_bone[b] = set(bf)
+                all_frames.update(frames_for_bone[b])
+            frames = sorted(all_frames)
         else:
-            quantity_frames = 0
-        
-        # create exported animation
-        action_export = {
-            "name": action_name,
-            "code": action_name,
-            "version": 0 if animation_version_0 else 1, # https://github.com/anegostudios/vsapi/blob/master/Common/Model/Shape/ShapeElement.cs#L277
-            "quantityframes": quantity_frames,
-            "onActivityStopped": on_activity_stopped,
-            "onAnimationEnd": on_animation_end,
-            "keyframes": keyframes,
-        }
+            frames = sparse_frames
+            for b in keyed_bones:
+                frames_for_bone[b] = set(frames)
 
-        animations.append(action_export)
+        # Determine quantityframes (preserve on roundtrip if available)
+        qf = action.get("vs_quantityframes", None)
+        if qf is None:
+            quantityframes = int(end - start + 1)
+        else:
+            try:
+                quantityframes = int(qf)
+            except Exception:
+                quantityframes = int(end - start + 1)
+        if quantityframes <= 0:
+            quantityframes = int(end - start + 1)
+
+        # Build bone objects and ensure parents are included for local-space conversion
+        data_bones = arm_data.bones
+        pose_bones = obj_armature.pose.bones
+
+        bones_to_eval = set()
+        animated_posebones = []
+
+        for bname in keyed_bones:
+            pb = pose_bones.get(bname)
+            db = data_bones.get(bname)
+            if pb is None or db is None:
+                continue
+            animated_posebones.append(pb)
+            # include parent chain
+            cur = db
+            while cur is not None:
+                bones_to_eval.add(cur.name)
+                cur = cur.parent
+
+        if not animated_posebones:
+            continue
+
+        # NOTE: Do not subtract a "root baseline" translation.
+        # Vintage Story allows (and many vanilla models rely on) constant root
+        # offsets/rotations authored in animations. Removing them makes the
+        # animation appear static or incorrect in VSMC.
+
+        # Determine which rotation channels the action actually animates for each bone.
+        # If a PoseBone is left in QUATERNION mode while keys are authored on
+        # rotation_euler (common after import), Blender will ignore those curves
+        # when computing pb.matrix, and we export zero rotations.
+        bone_rot_mode = {}
+        for fcu in fcurves:
+            dp = getattr(fcu, "data_path", "") or ""
+            bname = extract_bone_from_datapath(dp)
+            if not bname:
+                continue
+            if ".rotation_quaternion" in dp:
+                bone_rot_mode[bname] = "QUATERNION"
+            elif ".rotation_euler" in dp or ".rotation_axis_angle" in dp:
+                # VS expects Euler; use Blender Euler order XZY to match VS axis mapping.
+                bone_rot_mode.setdefault(bname, "XZY")
+
+        obj_armature.animation_data.action = action
+
+        # Force pose bones into a compatible rotation mode for evaluation.
+        # (Save original modes so we can restore after export.)
+        orig_rot_modes = {}
+        try:
+            for bn in bones_to_eval:
+                pb = pose_bones.get(bn)
+                if pb is None:
+                    continue
+                orig_rot_modes[bn] = pb.rotation_mode
+                desired = bone_rot_mode.get(bn)
+                if desired == "QUATERNION":
+                    pb.rotation_mode = "QUATERNION"
+                elif desired == "XZY":
+                    pb.rotation_mode = "XZY"
+                else:
+                    # default to XZY so rotation_euler curves are always respected
+                    pb.rotation_mode = "XZY"
+        except Exception:
+            orig_rot_modes = {}
+
+        keyframes_out = []
+        any_motion = False
+        # Track previous VS-space euler angles per emitted element name so we can
+        # keep continuity when converting from quaternions (or ambiguous euler branches).
+        prev_rot = {}
+
+        def unwrap_axis(prev_val, cur_val):
+            """Return cur_val adjusted by +/-360*n to be closest to prev_val."""
+            try:
+                pv = float(prev_val)
+                cv = float(cur_val)
+                if not math.isfinite(pv) or not math.isfinite(cv):
+                    return cv
+                k = int(round((pv - cv) / 360.0))
+                return cv + 360.0 * k
+            except Exception:
+                return cur_val
+
+        # Precompute rest matrices in world space
+        rest_world = {}
+        for bn in bones_to_eval:
+            db = data_bones.get(bn)
+            if db is None:
+                continue
+            rest_world[bn] = (obj_armature.matrix_world @ db.matrix_local).copy()
+
+        for frame in frames:
+            try:
+                scene.frame_set(frame)
+            except Exception:
+                continue
+
+            # pose matrices in world space for needed bones
+            pose_world = {}
+            for bn in bones_to_eval:
+                pb = pose_bones.get(bn)
+                if pb is None:
+                    continue
+                pose_world[bn] = (obj_armature.matrix_world @ pb.matrix).copy()
+
+            frame_elements = {}
+
+            for pb in animated_posebones:
+                bn = pb.name
+                # Smart bake: only emit this bone on frames we planned for it.
+                try:
+                    if bn in frames_for_bone and frame not in frames_for_bone[bn]:
+                        continue
+                except Exception:
+                    pass
+                db = data_bones.get(bn)
+                if db is None:
+                    continue
+                parent = db.parent.name if db.parent else None
+
+                # parent-relative local matrices (both rest and pose)
+                if parent and parent in rest_world and parent in pose_world:
+                    rest_loc = rest_world[parent].inverted_safe() @ rest_world[bn]
+                    pose_loc = pose_world[parent].inverted_safe() @ pose_world[bn]
+                else:
+                    rest_loc = rest_world[bn]
+                    pose_loc = pose_world[bn]
+
+                delta = rest_loc.inverted_safe() @ pose_loc
+                loc, rot_quat, _scale = delta.decompose()
+
+                # VS axes: offsets X->Blender Y, Y->Blender Z, Z->Blender X
+                off_x = safe_f(loc.y)
+                off_y = safe_f(loc.z)
+                off_z = safe_f(loc.x)
+
+                # Rotation export:
+                # - If the action keys rotation_euler, preserve the *exact* Euler values
+                #   (including windings > 360 deg) for WYSIWYG in VSMC.
+                # - If the action keys rotation_quaternion, fall back to quaternion->Euler.
+                if bone_rot_mode.get(bn) == "QUATERNION":
+                    r = to_vintagestory_rotation(rot_quat)
+                else:
+                    # pb.rotation_mode was forced to XZY above when Euler curves exist.
+                    e = pb.rotation_euler
+                    r = np.array([
+                        safe_f(e.y) * RAD_TO_DEG,
+                        safe_f(e.z) * RAD_TO_DEG,
+                        safe_f(e.x) * RAD_TO_DEG,
+                    ])
+
+                # IMPORTANT: do NOT clamp/wrap angles. VS/VSMC should receive the authored
+                # values so long rotations don't get "shortest-pathed".
+                rot_x = safe_f(r[0])
+                rot_y = safe_f(r[1])
+                rot_z = safe_f(r[2])
+
+                # Optional: keep Euler continuity between sampled frames.
+                # This is useful when Blender authored quaternion motion (slerp) is converted
+                # to Euler and the representation "jumps" by ±360 even though rotation is smooth.
+                out_name = bone_export_name(db)
+                if rotate_shortest_distance and out_name in prev_rot:
+                    prx, pry, prz = prev_rot[out_name]
+                    rot_x = unwrap_axis(prx, rot_x)
+                    rot_y = unwrap_axis(pry, rot_y)
+                    rot_z = unwrap_axis(prz, rot_z)
+
+                # snap tiny values to 0
+                if near_zero(off_x, tol_loc): off_x = 0.0
+                if near_zero(off_y, tol_loc): off_y = 0.0
+                if near_zero(off_z, tol_loc): off_z = 0.0
+                if near_zero(rot_x, tol_rot_deg): rot_x = 0.0
+                if near_zero(rot_y, tol_rot_deg): rot_y = 0.0
+                if near_zero(rot_z, tol_rot_deg): rot_z = 0.0
+
+                # Track if there is any non-zero motion anywhere (for skipping empty actions)
+                if off_x != 0.0 or off_y != 0.0 or off_z != 0.0 or rot_x != 0.0 or rot_y != 0.0 or rot_z != 0.0:
+                    any_motion = True
+
+                # Output schema (no stretch). Always include offsets so downstream
+                # tools don't have to guess when a channel is "missing" vs "0".
+                el = {
+                    "offsetX": off_x,
+                    "offsetY": off_y,
+                    "offsetZ": off_z,
+                    "rotationX": rot_x,
+                    "rotationY": rot_y,
+                    "rotationZ": rot_z,
+                }
+
+                if rotate_shortest_distance:
+                    el["rotShortestDistanceX"] = True
+                    el["rotShortestDistanceY"] = True
+                    el["rotShortestDistanceZ"] = True
+
+                frame_elements[out_name] = el
+
+                if rotate_shortest_distance:
+                    prev_rot[out_name] = (rot_x, rot_y, rot_z)
+
+            # Don't emit empty keyframes
+            if frame_elements:
+                keyframes_out.append({
+                    "frame": int(frame - start),
+                    "elements": frame_elements
+                })
+
+        if not any_motion or not keyframes_out:
+            continue
+
+        anim_name = action.get("vs_anim_name", action.name)
+        anim_code = action.get("vs_anim_code", action.name)
+
+        animations.append({
+            "name": anim_name,
+            "code": anim_code,
+            "quantityframes": int(quantityframes),
+            "onActivityStopped": action.get("on_activity_stopped", "PlayTillEnd"),
+            "onAnimationEnd": action.get("on_animation_end", "EaseOut"),
+            "keyframes": keyframes_out,
+        })
+
+        # Restore original pose-bone rotation modes for this action
+        try:
+            for bn, rm in orig_rot_modes.items():
+                pb = pose_bones.get(bn)
+                if pb is not None:
+                    pb.rotation_mode = rm
+        except Exception:
+            pass
+
+    # restore state
+    try:
+        scene.frame_set(orig_frame)
+    except Exception:
+        pass
+    try:
+        arm_data.pose_position = orig_pose_pos
+    except Exception:
+        pass
+
+    if obj_armature.animation_data:
+        obj_armature.animation_data.action = orig_action
+
+    # restore NLA mute states
+    try:
+        for tr, m in orig_nla_mute:
+            tr.mute = m
+    except Exception:
+        pass
 
     return animations
 
@@ -1346,7 +1894,7 @@ def save_objects_by_armature(
     export_generated_texture=True, # export generated color texture
     texture_size_x_override=None,  # texture size overrides
     texture_size_y_override=None,  # texture size overrides
-    use_main_object_as_bone=True,  # allow using main object as bone
+    use_main_object_as_bone=False,  # allow using main object as bone
 ):
     """Recursively save object children of a bone to a parent
     bone object
@@ -1459,7 +2007,7 @@ def save_objects_by_armature(
                 export_generated_texture=export_generated_texture,
                 texture_size_x_override=texture_size_x_override,
                 texture_size_y_override=texture_size_y_override,
-                use_main_object_as_bone=use_main_object_as_bone,
+                use_main_object_as_bone=False,
             )
             if child_element is not None:
                 bone_element["children"].append(child_element)
@@ -1482,12 +2030,19 @@ def save_objects(
     skip_texture_export=False,
     minify=False,
     decimal_precision=-1,
-    export_armature=True,
+    export_armature=False,
     export_animations=True,
     generate_animations_file=False,
-    use_main_object_as_bone=True,
+    bake_animations=False,
+    bake_step=1,
+    smart_bake_only=False,
+    sanitize_keyframes=False,
+    sanitize_epsilon=1e-4,
+    sanitize_rot_clamp_deg=7200.0,
+    use_main_object_as_bone=False,
     use_step_parent=True,
-    rotate_shortest_distance=True,
+    repair_hierarchy=False,
+    rotate_shortest_distance=False,
     animation_version_0=False,
     logger=None,
     **kwargs
@@ -1547,6 +2102,11 @@ def save_objects(
         Transform root elements relative to their step parent element, so
         elements are correctly attached in game.
         TODO: make this flag actually work, right now automatically enabled
+    repair_hierarchy : bool
+        Attempt to reconstruct a parent/child hierarchy for VS elements when the
+        original VS metadata (obj['vs_parent']) is missing or broken.
+        Useful for edge cases where objects were unparented or bone-parented
+        and animation inheritance breaks after export.
     rotate_shortest_distance : bool
         Use shortest distance rotation interpolation for animations.
         This sets the "rotShortestDistance_" flags in the output keyframes.
@@ -1564,17 +2124,70 @@ def save_objects(
         - message_type: set of message types, e.g. {"WARNING"} or {"INFO"}
         - message: string message, for use in `op.report(type, message)`.
     """
+    # Sync datablock names to object names right before export (helps VS JSON / VSMC and avoids stale Cube.### names)
+    try:
+        import bpy
+        for _o in bpy.data.objects:
+            try:
+                if getattr(_o, "data", None) is not None and getattr(_o.data, "users", 0) == 1:
+                    _o.data.name = _o.name
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     if filepath == "" or filepath is None:
         return {"CANCELLED"}, {"ERROR"}, "No output file path specified"
+
+    # ------------------------------------------------------------
+    # Pre-export cleanup/sync
+    # - Ensure datablock names match object names (fixes Cube.### leftovers)
+    # - Must run as late as possible, right before we read scene data
+    # ------------------------------------------------------------
+    try:
+        import bpy
+        for obj in bpy.data.objects:
+            data = getattr(obj, "data", None)
+            if data is not None and getattr(data, "users", 0) == 1:
+                data.name = obj.name
+    except Exception:
+        pass
+
+    # Vintage Story JSON does not support exporting Blender armatures/bones as model elements.
+    # Bones are an authoring rig only; we always export the VS element hierarchy.
+    export_armature = False
+    use_main_object_as_bone = False
+    animation_version_0 = False
     
     # export status, may be modified by function if errors occur
     status = {"INFO"}
 
+    # Resolve texture size for UV export.
+    # Prefer explicit overrides, otherwise use the size declared in the imported VS JSON (stored on the scene),
+    # and finally fall back to 16.
+    scn = bpy.context.scene
+    declared_w = scn.get("vs_textureWidth", None)
+    declared_h = scn.get("vs_textureHeight", None)
+
+    # Only force overrides if we have declared sizes and the user didn't explicitly override.
+    if texture_size_x_override is None and declared_w is not None:
+        try:
+            texture_size_x_override = float(declared_w)
+        except Exception:
+            pass
+    if texture_size_y_override is None and declared_h is not None:
+        try:
+            texture_size_y_override = float(declared_h)
+        except Exception:
+            pass
+
+    tex_w_header = 16 if texture_size_x_override is None else texture_size_x_override
+    tex_h_header = 16 if texture_size_y_override is None else texture_size_y_override
+
     # output json model stub
     model_json = {
-        # default texture sizes, will be overridden
-        "textureWidth": 16 if texture_size_x_override is None else texture_size_x_override,
-        "textureHeight": 16 if texture_size_y_override is None else texture_size_y_override,
+        "textureWidth": int(tex_w_header) if abs(tex_w_header - int(tex_w_header)) < 1e-6 else tex_w_header,
+        "textureHeight": int(tex_h_header) if abs(tex_h_header - int(tex_h_header)) < 1e-6 else tex_h_header,
         "textures": {},
         "textureSizes": {},
     }
@@ -1596,10 +2209,17 @@ def save_objects(
     model_textures: dict[str, FaceMaterial] = {}
     
     # first pass: check if parsing an armature
+    # NOTE: VS JSON does not support exporting Blender armatures/bones as elements.
+    # Always export element objects (cuboids) only.
+    export_armature = False
+
     armature = None
     root_bones = []
     bone_hierarchy = None
-    export_objects = objects
+    export_objects = [o for o in objects if getattr(o, "type", None) != "ARMATURE"]
+    # Keep reference to armature for animation baking (not exported as VS elements)
+    _all_objs_for_armature = list(objects)
+
 
     # check if any objects have step parent, this means root objects
     # need armature bone offsets
@@ -1611,6 +2231,57 @@ def save_objects(
     
     # check if any objects in scene are armatures
     scene_armatures = get_armatures_from_objects(bpy.data.objects, skip_disabled_render=skip_disabled_render)
+
+    # ---------------------------------------------------------------------
+    # Animation export needs an armature even when we are not exporting the
+    # model hierarchy "by armature" (we always export VS elements/objects).
+    #
+    # Prior bug: if no StepParentName was used and export_armature was forced
+    # off, we never resolved an armature, so animation export silently
+    # produced an empty "animations" list.
+    # ---------------------------------------------------------------------
+    if export_animations and armature is None:
+        candidates = {}
+
+        def _bump(a, w=1):
+            if a is None or getattr(a, "type", None) != "ARMATURE":
+                return
+            candidates[a] = candidates.get(a, 0) + w
+
+        # Prefer an explicitly included armature, else armatures that actually
+        # drive the exported objects (via parenting/modifiers), else fall back
+        # to the single armature in the scene.
+        for o in _all_objs_for_armature:
+            if getattr(o, "type", None) == "ARMATURE":
+                _bump(o, 100)
+                continue
+
+            # If the object is influenced by an armature (armature modifier or
+            # parent chain), this will generally find it.
+            try:
+                _bump(o.find_armature(), 10)
+            except Exception:
+                pass
+
+            # Bone-parented objects have parent == armature
+            try:
+                if getattr(o, "parent", None) is not None and getattr(o.parent, "type", None) == "ARMATURE":
+                    _bump(o.parent, 10)
+            except Exception:
+                pass
+
+        if candidates:
+            armature = max(candidates.items(), key=lambda kv: kv[1])[0]
+            try:
+                root_bones, bone_hierarchy = get_bone_hierarchy_from_armature(armature)
+            except Exception:
+                root_bones, bone_hierarchy = [], None
+        elif len(scene_armatures) == 1:
+            armature = scene_armatures[0]
+            try:
+                root_bones, bone_hierarchy = get_bone_hierarchy_from_armature(armature)
+            except Exception:
+                root_bones, bone_hierarchy = [], None
 
     # case 1. exporting objects with step parent property, need armature
     # for performing transform offset calculations
@@ -1642,6 +2313,46 @@ def save_objects(
             for bone in root_bones:
                 export_objects.append(bone_hierarchy[bone.name].main)
     
+    # ---------------------------------------------------------------------
+    # Bone -> export-name mapping
+    #
+    # Imported VS models use bones for animation authoring, but VS JSON tracks
+    # animate named nodes. If the user renames cubes/objects in the Outliner,
+    # we want both the exported *elements* and exported *animations* to use the
+    # new names.
+    #
+    # We do this by writing a transient custom property on data bones:
+    #     bone["vs_export_name"]
+    # Animation export will prefer this value.
+    # ---------------------------------------------------------------------
+    if armature is not None and bone_hierarchy is not None:
+        def _vs_object_export_name(o):
+            try:
+                if "rename" in o and isinstance(o["rename"], str) and o["rename"].strip():
+                    return o["rename"]
+            except Exception:
+                pass
+            try:
+                vs_name = o.get("vs_name") if hasattr(o, "get") else None
+                imp = o.get("vs_import_blender_name") if hasattr(o, "get") else None
+                if isinstance(vs_name, str) and isinstance(imp, str) and o.name == imp:
+                    return vs_name
+            except Exception:
+                pass
+            return getattr(o, "name", "") or ""
+
+        for bname, bnode in getattr(bone_hierarchy, "items", lambda: [])():
+            try:
+                bone = armature.data.bones.get(bname)
+                if bone is None:
+                    continue
+                main_obj = getattr(bnode, "main", None)
+                if main_obj is None:
+                    continue
+                bone["vs_export_name"] = _vs_object_export_name(main_obj)
+            except Exception:
+                pass
+
     # =========================================================================
     # export by armature
     # =========================================================================
@@ -1659,40 +2370,367 @@ def save_objects(
                 export_generated_texture=generate_texture,
                 texture_size_x_override=texture_size_x_override,
                 texture_size_y_override=texture_size_y_override,
-                use_main_object_as_bone=use_main_object_as_bone,
+                use_main_object_as_bone=False,
             )
             if element is not None:
                 root_elements.append(element)
+
     else:
+
+        # ---------------------------------------------------------------------
+        # Geometry export must be in REST pose; to do that reliably we need the
+        # driving armature even if the user disabled animation export. Imported
+        # VS models are typically bone-parented, so without an armature the
+        # current pose/frame can accidentally bake into the exported geometry.
+        # ---------------------------------------------------------------------
+        if armature is None:
+            exported_armatures = []
+            try:
+                exported_armatures = get_armatures_from_objects(_all_objs_for_armature, skip_disabled_render=skip_disabled_render)
+            except Exception:
+                exported_armatures = []
+            if len(exported_armatures) > 0:
+                armature = exported_armatures[0]
+            else:
+                # Fallback: look for parent armature
+                for _o in _all_objs_for_armature:
+                    if getattr(_o, "parent", None) is not None and getattr(_o.parent, "type", None) == "ARMATURE":
+                        armature = _o.parent
+                        break
+                if armature is None:
+                    scene_armatures = [o for o in bpy.context.scene.objects if o.type == "ARMATURE"]
+                    if len(scene_armatures) > 0:
+                        armature = scene_armatures[0]
+
+        # ---------------------------------------------------------------------
+        # Geometry export must be in REST pose with no action, otherwise the
+        # current pose/frame bakes into the model (wrong).
+        # ---------------------------------------------------------------------
+        _arm_restore = None
+        if armature is not None:
+            try:
+                armature.animation_data_create()
+                _arm_restore = (armature.data.pose_position, armature.animation_data.action, bpy.context.scene.frame_current)
+                armature.data.pose_position = "REST"
+                armature.animation_data.action = None
+                bpy.context.view_layer.update()
+            except Exception:
+                _arm_restore = None
         # =====================================================================
-        # normal export geometry tree
+        # normal export geometry tree (VS hierarchy)
         # =====================================================================
-        for obj in export_objects:
-            if skip_disabled_render and obj.hide_render:
-                continue
-            
+        # Imported rigs are typically bone-parented, which destroys Blender object
+        # parenting. Preserve the original VS "parented to" chain using obj['vs_parent'].
+        def _export_name(o):
+            if o is None:
+                return ""
+            try:
+                if "rename" in o and isinstance(o["rename"], str) and o["rename"].strip():
+                    return o["rename"]
+            except Exception:
+                pass
+            try:
+                vs_name = o.get("vs_name") if hasattr(o, "get") else None
+                imp = o.get("vs_import_blender_name") if hasattr(o, "get") else None
+                if isinstance(vs_name, str) and vs_name.strip() and isinstance(imp, str) and imp and o.name == imp:
+                    return vs_name
+            except Exception:
+                pass
+            return o.name
+
+        def _is_elem(o):
+            if o is None:
+                return False
+            if o.type == "MESH":
+                return True
+            if o.type == "EMPTY" and (o.name.startswith("dummy_")):
+                return True
+            return False
+
+        def _is_attach(o):
+            return o is not None and o.type == "EMPTY" and o.name.startswith("attach_")
+
+        # elements and attachpoints in export set
+        elem_objs = [o for o in export_objects if _is_elem(o)]
+        attach_objs = [o for o in export_objects if _is_attach(o)]
+
+        name_to_obj = {}
+        for o in elem_objs:
+            # Map multiple aliases so VS hierarchy links keep working even after renames.
+            # - current Blender name
+            # - original VS name (vs_name)
+            # - Blender name at import time (vs_import_blender_name)
+            # - explicit override (rename)
+            keys = []
+
+            try:
+                keys.append(o.name)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(o, "get"):
+                    vsn = o.get("vs_name")
+                    if isinstance(vsn, str) and vsn:
+                        keys.append(vsn)
+                    impn = o.get("vs_import_blender_name")
+                    if isinstance(impn, str) and impn:
+                        keys.append(impn)
+                    rn = o.get("rename")
+                    if isinstance(rn, str) and rn:
+                        keys.append(rn)
+            except Exception:
+                pass
+
+            # export name (handles whitespace preservation when unchanged)
+            try:
+                keys.append(_export_name(o))
+            except Exception:
+                pass
+
+            for k in keys:
+                if isinstance(k, str) and k:
+                    name_to_obj[k] = o
+                    name_to_obj[k.strip()] = o
+
+        # parent map (VS hierarchy)
+        # Primary source: obj['vs_parent'] (set on import) so we can preserve VS hierarchy
+        # even when objects were bone-parented (which destroys Blender object parenting).
+        #
+        # Optional repair: when the user has cleared custom props / parenting, we can
+        # reconstruct a reasonable hierarchy using:
+        #   1) Blender object parenting (if present)
+        #   2) Armature bone parent chain (if bone-parented)
+        #   3) Spatial inference (smallest enclosing/closest element by AABB)
+        if repair_hierarchy and armature is not None and bone_hierarchy is None:
+            try:
+                _, bone_hierarchy = get_bone_hierarchy_from_armature(armature)
+            except Exception:
+                bone_hierarchy = None
+
+        def _infer_parent_from_bone(obj):
+            """If obj is bone-parented, infer its VS parent from the bone parent chain."""
+            try:
+                if armature is None or bone_hierarchy is None:
+                    return None
+                if getattr(obj, "parent", None) is None or getattr(obj.parent, "type", None) != "ARMATURE":
+                    return None
+                bone_name = getattr(obj, "parent_bone", "") or ""
+                if not bone_name:
+                    return None
+                bone = armature.data.bones.get(bone_name)
+                if bone is None or bone.parent is None:
+                    return None
+                pb = bone.parent
+                if pb.name not in bone_hierarchy:
+                    return None
+                p_obj = getattr(bone_hierarchy[pb.name], "main", None)
+                return p_obj if p_obj in elem_objs else None
+            except Exception:
+                return None
+
+        def _spatial_parent_map(objs):
+            """Infer a hierarchy when all metadata is missing.
+
+            Heuristic: choose the parent whose world-space AABB contains (or is closest to)
+            the child's origin, preferring the smallest such parent.
+            """
+            from mathutils import Vector
+            # Precompute world AABBs + origins
+            aabb = {}
+            origin = {}
+            vol = {}
+            for o in objs:
+                try:
+                    pts = [o.matrix_world @ Vector(c) for c in o.bound_box]
+                    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+                    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+                    aabb[o] = (mn, mx)
+                    origin[o] = o.matrix_world.translation.copy()
+                    d = mx - mn
+                    vol[o] = abs(d.x * d.y * d.z)
+                except Exception:
+                    aabb[o] = (Vector((0, 0, 0)), Vector((0, 0, 0)))
+                    origin[o] = Vector((0, 0, 0))
+                    vol[o] = 0.0
+
+            def _dist_point_aabb(p, mn, mx):
+                dx = max(mn.x - p.x, 0.0, p.x - mx.x)
+                dy = max(mn.y - p.y, 0.0, p.y - mx.y)
+                dz = max(mn.z - p.z, 0.0, p.z - mx.z)
+                return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            mapping = {}
+            for child in objs:
+                best_parent = None
+                best_key = None
+                child_v = vol.get(child, 0.0)
+                p0 = origin.get(child)
+                if p0 is None:
+                    mapping[child] = None
+                    continue
+                for cand in objs:
+                    if cand is child:
+                        continue
+                    # Prevent tiny mutual loops: parent should be meaningfully larger.
+                    if vol.get(cand, 0.0) < child_v * 1.01:
+                        continue
+                    mn, mx = aabb[cand]
+                    d = _dist_point_aabb(p0, mn, mx)
+                    key = (d, vol.get(cand, 0.0))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_parent = cand
+                # If everything fails, root.
+                mapping[child] = best_parent
+            return mapping
+
+        parent_map = {}
+        missing_vs_parent = 0
+        for o in elem_objs:
+            p = None
+            try:
+                vs_parent = o.get("vs_parent")
+            except Exception:
+                vs_parent = None
+
+            if isinstance(vs_parent, str) and vs_parent:
+                p = name_to_obj.get(vs_parent) or name_to_obj.get(vs_parent.strip())
+            else:
+                missing_vs_parent += 1
+
+            # Optional repairs for missing/broken vs_parent
+            if repair_hierarchy and p is None:
+                # 1) Blender object parenting (ignore Armature parent here)
+                try:
+                    if getattr(o, "parent", None) is not None and getattr(o.parent, "type", None) != "ARMATURE" and o.parent in elem_objs:
+                        p = o.parent
+                except Exception:
+                    pass
+
+            if repair_hierarchy and p is None:
+                # 2) Bone parent chain
+                p = _infer_parent_from_bone(o)
+
+            parent_map[o] = p
+
+        # 3) Spatial inference as a last resort when the hierarchy is completely missing.
+        if repair_hierarchy and len(elem_objs) > 1 and missing_vs_parent == len(elem_objs):
+            try:
+                spatial = _spatial_parent_map(elem_objs)
+                # only fill where we still have no parent
+                for o in elem_objs:
+                    if parent_map.get(o) is None:
+                        parent_map[o] = spatial.get(o)
+            except Exception:
+                pass
+
+        # attachpoints parent map: prefer stored vs_parent, else use Blender parent if it is a VS element
+        attach_parent = {}
+        for a in attach_objs:
+            p = None
+            vs_parent = a.get("vs_parent")
+            if isinstance(vs_parent, str) and vs_parent:
+                p = name_to_obj.get(vs_parent) or name_to_obj.get(vs_parent.strip())
+            if p is None and a.parent in elem_objs:
+                p = a.parent
+            attach_parent[a] = p
+
+        # children maps
+        children_map = {o: [] for o in elem_objs}
+        for o, p in parent_map.items():
+            if p is not None and p in children_map:
+                children_map[p].append(o)
+
+        attach_map = {o: [] for o in elem_objs}
+        for a, p in attach_parent.items():
+            if p is not None and p in attach_map:
+                attach_map[p].append(a)
+
+        roots = [o for o in elem_objs if parent_map.get(o) is None]
+
+        def export_tree(o, parent_obj, parent_matrix_world, parent_cube_origin, parent_rotation_origin):
+            if skip_disabled_render and o.hide_render:
+                return None
+
             element = generate_element(
-                obj,
+                o,
                 skip_disabled_render=skip_disabled_render,
-                parent=None,
-                armature=armature,
-                bone_hierarchy=bone_hierarchy,
+                parent=parent_obj,
+                armature=None,
+                bone_hierarchy=None,
                 groups=groups,
                 model_colors=model_colors,
                 model_textures=model_textures,
-                parent_cube_origin=np.array([0., 0., 0.]),     # root cube origin 
-                parent_rotation_origin=np.array([0., 0., 0.]), # root rotation origin
+                parent_matrix_world=parent_matrix_world,
+                parent_cube_origin=parent_cube_origin,
+                parent_rotation_origin=parent_rotation_origin,
                 export_uvs=export_uvs,
                 export_generated_texture=generate_texture,
                 texture_size_x_override=texture_size_x_override,
                 texture_size_y_override=texture_size_y_override,
+                skip_children_recurse=True,
+            )
+            if element is None:
+                return None
+
+            # rebuild children explicitly from VS hierarchy
+            element_children = []
+            for ch in children_map.get(o, []):
+                ce = export_tree(
+                    ch,
+                    o,
+                    o.matrix_world.copy(),
+                    element.get("from", np.array([0., 0., 0.])),
+                    element.get("rotationOrigin", np.array([0., 0., 0.])),
+                )
+                if ce is not None:
+                    element_children.append(ce)
+            element["children"] = element_children
+
+            # attachpoints (kept separate in VS)
+            ap_elems = []
+            for ap in attach_map.get(o, []):
+                if skip_disabled_render and ap.hide_render:
+                    continue
+                ae = generate_element(
+                    ap,
+                    skip_disabled_render=skip_disabled_render,
+                    parent=o,
+                    armature=None,
+                    bone_hierarchy=None,
+                    groups=groups,
+                    model_colors=model_colors,
+                    model_textures=model_textures,
+                    parent_matrix_world=o.matrix_world.copy(),
+                    parent_cube_origin=element.get("from", np.array([0., 0., 0.])),
+                    parent_rotation_origin=element.get("rotationOrigin", np.array([0., 0., 0.])),
+                    export_uvs=export_uvs,
+                    export_generated_texture=generate_texture,
+                    texture_size_x_override=texture_size_x_override,
+                    texture_size_y_override=texture_size_y_override,
+                    skip_children_recurse=True,
+                )
+                if ae is not None:
+                    ap_elems.append(ae)
+            if len(ap_elems) > 0:
+                element["attachmentpoints"] = ap_elems
+
+            return element
+
+        for obj in roots:
+            element = export_tree(
+                obj,
+                None,
+                None,
+                np.array([0., 0., 0.]),
+                np.array([0., 0., 0.]),
             )
             if element is not None:
-                if obj.name.startswith("attach_"):
-                    continue # skip root attach points
-                else:
-                    root_elements.append(element)
-    
+                # skip root attach points
+                if isinstance(obj.name, str) and obj.name.startswith("attach_"):
+                    continue
+                root_elements.append(element)
     # =========================================================================
     # Color texture image generation
     # =========================================================================
@@ -1826,12 +2864,262 @@ def save_objects(
     # =========================================================================
     if export_animations:
         animations = save_all_animations(
-            bone_hierarchy,
+            armature,
+            export_objects=objects,
             rotate_shortest_distance=rotate_shortest_distance,
-            animation_version_0=animation_version_0,
+            smart_bake_only=smart_bake_only,
+            bake_animations=bake_animations,
+            bake_step=bake_step,
         )
         if len(animations) > 0:
             model_json["animations"] = animations
+
+    # =========================================================================
+    # Keyframe sanitizer (opt-in)
+    # - unwrap Euler angles per channel
+    # - snap near-zero noise to 0
+    # - clamp extreme values and report
+    # =========================================================================
+    def _isfinite_num(v):
+        try:
+            fv = float(v)
+            return math.isfinite(fv)
+        except Exception:
+            return False
+
+    def _sanitize_animations(anims, eps=1e-4, rot_clamp=7200.0):
+        issues = []
+        if not anims:
+            return issues
+        rot_clamp = abs(float(rot_clamp)) if rot_clamp is not None else 0.0
+        for anim in anims:
+            prev = {}  # element -> (rx, ry, rz)
+            # Iterate keyframes in order; for each element present, unwrap against last seen.
+            kfs = anim.get("keyframes", []) or []
+            kfs.sort(key=lambda k: int(k.get("frame", 0)))
+            for kf in kfs:
+                elems = kf.get("elements", {}) or {}
+                for ename, tr in elems.items():
+                    if not isinstance(tr, dict):
+                        continue
+
+                    # Snap small noise
+                    for key in ("offsetX", "offsetY", "offsetZ", "rotationX", "rotationY", "rotationZ"):
+                        if key in tr:
+                            try:
+                                val = float(tr[key])
+                                if not math.isfinite(val):
+                                    issues.append(f"Non-finite {key} on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'. Set to 0.")
+                                    val = 0.0
+                                if abs(val) < eps:
+                                    val = 0.0
+                                tr[key] = val
+                            except Exception:
+                                issues.append(f"Non-numeric {key} on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'. Set to 0.")
+                                tr[key] = 0.0
+
+                    # Unwrap rotations per-channel
+                    rx = float(tr.get("rotationX", 0.0))
+                    ry = float(tr.get("rotationY", 0.0))
+                    rz = float(tr.get("rotationZ", 0.0))
+
+                    if ename in prev:
+                        prx, pry, prz = prev[ename]
+                        def _unwrap(p, c):
+                            try:
+                                k = int(round((p - c) / 360.0))
+                                return c + 360.0 * k
+                            except Exception:
+                                return c
+                        rx = _unwrap(prx, rx)
+                        ry = _unwrap(pry, ry)
+                        rz = _unwrap(prz, rz)
+
+                    # Clamp extreme rotations (helps broken conversions)
+                    if rot_clamp > 0.0:
+                        def _clamp(v):
+                            if v > rot_clamp:
+                                return rot_clamp
+                            if v < -rot_clamp:
+                                return -rot_clamp
+                            return v
+                        crx, cry, crz = _clamp(rx), _clamp(ry), _clamp(rz)
+                        if (crx, cry, crz) != (rx, ry, rz):
+                            issues.append(f"Clamped rotation on '{ename}' in anim '{anim.get('code', anim.get('name',''))}'.")
+                        rx, ry, rz = crx, cry, crz
+
+                    tr["rotationX"], tr["rotationY"], tr["rotationZ"] = rx, ry, rz
+                    prev[ename] = (rx, ry, rz)
+        return issues
+
+    if sanitize_keyframes and "animations" in model_json:
+        san_issues = _sanitize_animations(model_json.get("animations", []), eps=sanitize_epsilon, rot_clamp=sanitize_rot_clamp_deg)
+        if san_issues:
+            print("\n[VS Export] Keyframe Sanitizer Report")
+            for s in san_issues[:200]:
+                print("  -", s)
+            if len(san_issues) > 200:
+                print(f"  ... {len(san_issues)-200} more")
+            if logger is not None:
+                try:
+                    logger.report({"WARNING"}, f"Keyframe sanitizer: {len(san_issues)} notes (see console)")
+                except Exception:
+                    pass
+
+    # =========================================================================
+    # Export validation report (ALWAYS runs; hard-fails on critical issues)
+    # =========================================================================
+    def _collect_elements(el_list):
+        out = []
+        stack = list(el_list or [])
+        while stack:
+            e = stack.pop()
+            if not isinstance(e, dict):
+                continue
+            out.append(e)
+            for c in e.get("children", []) or []:
+                stack.append(c)
+        return out
+
+    def _validate_export(model):
+        errors = []
+        warnings = []
+
+        roots = model.get("elements", []) or []
+        if len(roots) == 0:
+            errors.append("No exported elements found.")
+        elif len(roots) > 1:
+            warnings.append(f"Model has {len(roots)} root elements (valid, but often indicates broken parenting).")
+
+        elems = _collect_elements(roots)
+        names = []
+        for e in elems:
+            n = e.get("name", None)
+            if isinstance(n, str):
+                names.append(n)
+        name_set = set(names)
+        if len(name_set) != len(names):
+            # duplicates are almost always fatal for animation resolution
+            dup = sorted({n for n in names if names.count(n) > 1})
+            errors.append(f"Duplicate element names detected: {', '.join(dup[:20])}" + ("..." if len(dup) > 20 else ""))
+
+        # Validate element numeric sanity
+        def _num_ok(v):
+            try:
+                fv = float(v)
+                return math.isfinite(fv)
+            except Exception:
+                return False
+
+        for e in elems:
+            fn = e.get("name", "<unnamed>")
+            fr = e.get("from", None)
+            to = e.get("to", None)
+            ro = e.get("rotationOrigin", None)
+            for label, arr in (("from", fr), ("to", to), ("rotationOrigin", ro)):
+                if arr is None:
+                    errors.append(f"Element '{fn}' missing '{label}'.")
+                    continue
+                if not isinstance(arr, (list, tuple)) or len(arr) != 3:
+                    errors.append(f"Element '{fn}' has invalid '{label}' (expected 3 numbers).")
+                    continue
+                if not all(_num_ok(x) for x in arr):
+                    errors.append(f"Element '{fn}' has non-finite values in '{label}'.")
+
+            # size sanity
+            if isinstance(fr, (list, tuple)) and isinstance(to, (list, tuple)) and len(fr) == 3 and len(to) == 3:
+                try:
+                    sx, sy, sz = float(to[0]) - float(fr[0]), float(to[1]) - float(fr[1]), float(to[2]) - float(fr[2])
+                    if sx < 0 or sy < 0 or sz < 0:
+                        errors.append(f"Element '{fn}' has negative size (to < from).")
+                    elif sx == 0 or sy == 0 or sz == 0:
+                        warnings.append(f"Element '{fn}' has zero size on at least one axis.")
+                except Exception:
+                    pass
+
+        # Validate animations
+        anims = model.get("animations", []) or []
+        if anims:
+            for anim in anims:
+                acode = anim.get("code", anim.get("name", "<anim>"))
+                kfs = anim.get("keyframes", []) or []
+                if not kfs:
+                    errors.append(f"Animation '{acode}' has no keyframes.")
+                    continue
+                # Track last values for extreme-delta detection per element
+                last = {}
+                for kf in kfs:
+                    if "frame" not in kf:
+                        errors.append(f"Animation '{acode}' has a keyframe missing 'frame'.")
+                        continue
+                    elems_k = kf.get("elements", None)
+                    if elems_k is None or not isinstance(elems_k, dict):
+                        errors.append(f"Animation '{acode}' keyframe {kf.get('frame','?')} missing 'elements' dict.")
+                        continue
+                    for ename, tr in elems_k.items():
+                        if ename not in name_set:
+                            errors.append(f"Animation '{acode}' targets missing element '{ename}'.")
+                            continue
+                        if not isinstance(tr, dict):
+                            errors.append(f"Animation '{acode}' keyframe {kf.get('frame','?')} element '{ename}' has invalid transform.")
+                            continue
+                        for key in ("offsetX", "offsetY", "offsetZ", "rotationX", "rotationY", "rotationZ"):
+                            if key not in tr:
+                                errors.append(f"Animation '{acode}' element '{ename}' missing '{key}'.")
+                                continue
+                            if not _num_ok(tr[key]):
+                                errors.append(f"Animation '{acode}' element '{ename}' has non-finite '{key}'.")
+
+                        # extreme delta check (warn; doesn't fail unless absurd)
+                        try:
+                            cur = (
+                                float(tr.get("offsetX", 0.0)), float(tr.get("offsetY", 0.0)), float(tr.get("offsetZ", 0.0)),
+                                float(tr.get("rotationX", 0.0)), float(tr.get("rotationY", 0.0)), float(tr.get("rotationZ", 0.0)),
+                            )
+                            if ename in last:
+                                prevv = last[ename]
+                                drot = max(abs(cur[3]-prevv[3]), abs(cur[4]-prevv[4]), abs(cur[5]-prevv[5]))
+                                dpos = max(abs(cur[0]-prevv[0]), abs(cur[1]-prevv[1]), abs(cur[2]-prevv[2]))
+                                if drot > 1440:
+                                    warnings.append(f"Animation '{acode}' element '{ename}' has large rotation jump ({drot:.1f} deg).")
+                                if drot > 20000:
+                                    errors.append(f"Animation '{acode}' element '{ename}' has absurd rotation jump ({drot:.1f} deg).")
+                                if dpos > 2000:
+                                    warnings.append(f"Animation '{acode}' element '{ename}' has large offset jump ({dpos:.3f}).")
+                                if dpos > 1e6:
+                                    errors.append(f"Animation '{acode}' element '{ename}' has absurd offset jump ({dpos:.3f}).")
+                            last[ename] = cur
+                        except Exception:
+                            pass
+
+        return errors, warnings
+
+    v_errors, v_warnings = _validate_export(model_json)
+    if v_errors or v_warnings:
+        print("\n[VS Export] Validation Report")
+        if v_errors:
+            print("Errors:")
+            for e in v_errors:
+                print("  -", e)
+        if v_warnings:
+            print("Warnings:")
+            for w in v_warnings[:200]:
+                print("  -", w)
+            if len(v_warnings) > 200:
+                print(f"  ... {len(v_warnings)-200} more")
+
+    if v_errors:
+        if logger is not None:
+            try:
+                logger.report({"ERROR"}, f"Export validation failed: {len(v_errors)} error(s) (see console)")
+            except Exception:
+                pass
+        return {"CANCELLED"}, {"ERROR"}, "Export cancelled due to validation errors (see console)"
+    elif v_warnings and logger is not None:
+        try:
+            logger.report({"WARNING"}, f"Export validation: {len(v_warnings)} warning(s) (see console)")
+        except Exception:
+            pass
 
     # =========================================================================
     # minification options to reduce .json file size
@@ -1869,7 +3157,9 @@ def save_objects(
                     elem[param] = round_float(elem[param])
 
             for face in elem["faces"].values():
-                face["uv"] = [round_float(x) for x in face["uv"]]
+                _uv = [round_float(x) for x in face["uv"]]
+                # VSMC is happiest with integer pixel UVs when possible.
+                face["uv"] = [int(round(v)) if abs(v - round(v)) < 1e-5 else v for v in _uv]
             
             for child in elem["children"]:
                 minify_element(child)
@@ -1908,6 +3198,20 @@ def save_objects(
         with open(animations_filepath, "w") as f:
             json.dump(animations_dict, f, separators=(",", ":"), indent=indent)
     
+    
+    # -------------------------------------------------------------------------
+    # Restore armature state (pose/action/frame) so exporting doesn't mutate scene
+    # -------------------------------------------------------------------------
+    if '_arm_restore' in locals() and _arm_restore is not None and armature is not None:
+        try:
+            armature.animation_data_create()
+            armature.data.pose_position = _arm_restore[0]
+            armature.animation_data.action = _arm_restore[1]
+            bpy.context.scene.frame_set(_arm_restore[2])
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
     if len(root_elements) == 0:
         status = {"WARNING"}
         return {"FINISHED"}, status, f"Exported to {filepath} (Warn: No objects exported)"

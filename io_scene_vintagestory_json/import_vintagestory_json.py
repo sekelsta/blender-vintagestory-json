@@ -2,6 +2,7 @@ import os
 import numpy as np
 import math
 import time
+import copy
 from math import inf
 import bpy
 from mathutils import Vector, Euler, Quaternion, Matrix
@@ -212,94 +213,192 @@ def parse_element(
     mesh.vertices[5].co[:] = v_max[0], v_min[1], v_max[2]
     mesh.vertices[6].co[:] = v_max[0], v_max[1], v_min[2]
     mesh.vertices[7].co[:] = v_max[0], v_max[1], v_max[2]
-
     # set face uvs
-    uv = e.get("faces")
-    if uv is not None:
-        if import_uvs:
-            face_normals = np.zeros((6,1,3))
-            for i, face in enumerate(mesh.polygons):
-                face_normals[i,0,0:3] = face.normal
-            
-            # map face normal -> face name
-            # NOTE: this process may not be necessary since new blender
-            # objects are created with the same face normal order,
-            # so could directly map index -> minecraft face name.
-            # keeping this in case the order changes in future
-            face_directions = np.argmax(np.sum(face_normals * DIRECTION_NORMALS, axis=2), axis=1)
-            face_directions = DIRECTIONS[face_directions]
+    uv_faces = e.get("faces") or {}
+    element_uv = e.get("uv")
+    element_uv0 = None
+    if isinstance(element_uv, (list, tuple)) and len(element_uv) == 2:
+        try:
+            element_uv0 = (float(element_uv[0]), float(element_uv[1]))
+        except Exception:
+            element_uv0 = None
 
-            # set uvs face order in blender loop, determined experimentally
-            uv_layer = mesh.uv_layers.active.data
-            for uv_direction, face in zip(face_directions, mesh.polygons):
-                face_uv = uv.get(uv_direction)
-                if face_uv is not None:
-                    if "uv" in face_uv:
-                        # unpack uv coords in minecraft coord space [xmin, ymin, xmax, ymax]
-                        # transform from minecraft [0, 16] space +x,-y space to blender [0,1] +x,+y
-                        face_uv_coords = face_uv["uv"]
-                        xmin = face_uv_coords[0] / tex_width
-                        ymin = 1.0 - face_uv_coords[3] / tex_height
-                        xmax = face_uv_coords[2] / tex_width
-                        ymax = 1.0 - face_uv_coords[1] / tex_height
-                    else:
-                        xmin = 0.0
-                        ymin = 1.0
-                        xmax = 1.0
-                        ymax = 0.0
-                    
-                    # write uv coords based on rotation
-                    rotation = 0
-                    if "rotation" in face_uv:
-                        rotation = face_uv["rotation"]
-                    if uv_direction == "down":
-                        rotation = (rotation + 180) % 360
-                    k = face.loop_start
-                    if rotation == 0:
-                        uv_layer[k].uv[0:2] = xmax, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymin
+    # Precompute "autoUv" rectangles from element-level uv offset (VSMC style).
+    # Many VSMC/Vintage Story shapes use element["uv"] with face["autoUv"]=true and omit explicit per-face uv rectangles.
+    auto_uv_rects = None
+    if element_uv0 is not None:
+        try:
+            # JSON coords: x, y, z
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            dz = abs(z2 - z1)
+            u0, v0 = element_uv0
 
-                    elif rotation == 90:
-                        uv_layer[k].uv[0:2] = xmax, ymax
-                        uv_layer[k+1].uv[0:2] = xmin, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymin
-                        uv_layer[k+3].uv[0:2] = xmax, ymin
+            # Standard box net (matches common model creators derived from MrCrayfish's Model Creator):
+            #   [  up  ][ down ]
+            # [west][north][east][south]
+            # (Coordinates are in pixel units in VS JSON space: origin top-left, +v downward.)
+            auto_uv_rects = {
+                "west":  (u0,            v0 + dz,       u0 + dz,            v0 + dz + dy),
+                "north": (u0 + dz,       v0 + dz,       u0 + dz + dx,       v0 + dz + dy),
+                "east":  (u0 + dz + dx,  v0 + dz,       u0 + dz + dx + dz,  v0 + dz + dy),
+                "south": (u0 + dz + dx + dz, v0 + dz,   u0 + dz + dx + dz + dx, v0 + dz + dy),
+                "up":    (u0 + dz,       v0,            u0 + dz + dx,       v0 + dz),
+                "down":  (u0 + dz + dx,  v0,            u0 + dz + dx + dx,  v0 + dz),
+            }
+        except Exception:
+            auto_uv_rects = None
 
-                    elif rotation == 180:
-                        uv_layer[k].uv[0:2] = xmin, ymax
-                        uv_layer[k+1].uv[0:2] = xmin, ymin
-                        uv_layer[k+2].uv[0:2] = xmax, ymin
-                        uv_layer[k+3].uv[0:2] = xmax, ymax
+    def _interpret_vs_uv_rect(uv4, tex_w, tex_h):
+        """Interpret a VS/VSMC uv array as either [x1,y1,x2,y2] or [x,y,w,h].
 
-                    elif rotation == 270:
-                        uv_layer[k].uv[0:2] = xmin, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymin
-                        uv_layer[k+2].uv[0:2] = xmax, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymax
+        Returns (xmin, ymin, xmax, ymax) in VS pixel space (top-left origin).
+        """
+        try:
+            u0, v0, u2, v2 = [float(v) for v in uv4]
+        except Exception:
+            return None
 
-                    else: # invalid rotation, should never occur... do default
-                        uv_layer[k].uv[0:2] = xmax, ymin
-                        uv_layer[k+1].uv[0:2] = xmax, ymax
-                        uv_layer[k+2].uv[0:2] = xmin, ymax
-                        uv_layer[k+3].uv[0:2] = xmin, ymin
+        # Candidate A: [x1,y1,x2,y2]
+        a = (u0, v0, u2, v2)
 
-                    # assign material
-                    if "texture" in face_uv:
-                        tex_name = face_uv["texture"][1:] # remove the "#" in start
-                        if tex_name in mesh_materials:
-                            face.material_index = mesh_materials[tex_name]
-                        else:
-                            if not tex_name in textures:
-                                textures[tex_name] = create_textured_principled_bsdf(tex_name, tex_name, 2, tex_width, tex_height)
-                            idx = len(obj.data.materials)
-                            obj.data.materials.append(textures[tex_name])
-                            mesh_materials[tex_name] = idx
-                            face.material_index = idx
+        # Candidate B: [x,y,w,h] -> [x1,y1,x1+w,y1+h]
+        b = (u0, v0, u0 + u2, v0 + v2)
 
-    # set name (choose whatever is available or "cube" if no name or comment is given)
-    obj.name = e.get("name") or "cube"
+        def ok(rect):
+            x1_, y1_, x2_, y2_ = rect
+            # allow swapped coords (flips), but require non-zero area
+            if abs(x2_ - x1_) < 1e-6 or abs(y2_ - y1_) < 1e-6:
+                return False
+            # bounds check (loose)
+            xmn, xmx = (min(x1_, x2_), max(x1_, x2_))
+            ymn, ymx = (min(y1_, y2_), max(y1_, y2_))
+            eps = 1e-3
+            return (xmx <= tex_w + eps) and (ymx <= tex_h + eps) and (xmn >= -eps) and (ymn >= -eps)
+
+        a_ok = ok(a)
+        b_ok = ok(b)
+
+        if a_ok and not b_ok:
+            return a
+        if b_ok and not a_ok:
+            return b
+        if a_ok and b_ok:
+            # Prefer the VS engine/our exporter convention when both are plausible.
+            return a
+
+        # neither passes strict checks, fall back to A
+        return a
+
+    if import_uvs and (uv_faces or auto_uv_rects is not None):
+        # get uvs per face in blender loop order
+        uv_layer = mesh.uv_layers.active.data
+
+        # Detect mesh face directions from normals.
+        # We compute the best matching direction by dot-product against the
+        # canonical face normals (same approach as the original importer).
+        face_normals = np.zeros((len(mesh.polygons), 1, 3), dtype=float)
+        for i, face in enumerate(mesh.polygons):
+            # face.normal is a mathutils.Vector
+            face_normals[i, 0, 0:3] = face.normal
+
+        # Map face normal -> direction index, then to direction name.
+        # DIRECTION_NORMALS has shape (6,6,3) and broadcasts against (F,1,3)
+        # producing (F,6,3) before summing over vector components.
+        dir_idx = np.argmax(np.sum(face_normals * DIRECTION_NORMALS, axis=2), axis=1)
+        face_directions = DIRECTIONS[dir_idx]
+
+        for uv_direction, face in zip(face_directions, mesh.polygons):
+            face_uv = uv_faces.get(uv_direction)
+
+            # Determine whether we should use explicit UVs or auto UVs
+            use_autouv = False
+            rotation = 0
+
+            if isinstance(face_uv, dict):
+                rotation = int(face_uv.get("rotation") or 0)
+                # In many VSMC exports, autoUv defaults to true when explicit uv isn't present.
+                if (face_uv.get("autoUv", True) is True) and ("uv" not in face_uv):
+                    use_autouv = True
+            else:
+                face_uv = None
+
+            # choose UV rectangle in VS pixel space
+            if face_uv is not None and "uv" in face_uv:
+                uv_rect = _interpret_vs_uv_rect(face_uv.get("uv"), tex_width, tex_height)
+                if uv_rect is None:
+                    uv_rect = (0.0, 0.0, tex_width, tex_height)
+                xmin_px, ymin_px, xmax_px, ymax_px = uv_rect
+            elif use_autouv and auto_uv_rects is not None and uv_direction in auto_uv_rects:
+                xmin_px, ymin_px, xmax_px, ymax_px = auto_uv_rects[uv_direction]
+            elif auto_uv_rects is not None and uv_direction in auto_uv_rects and face_uv is None:
+                # faces missing entirely, but element has UV offset: assume auto unwrap
+                xmin_px, ymin_px, xmax_px, ymax_px = auto_uv_rects[uv_direction]
+            else:
+                # default full map
+                xmin_px, ymin_px, xmax_px, ymax_px = (0.0, 0.0, tex_width, tex_height)
+
+            # convert VS coords (top-left origin) to Blender normalized UVs (bottom-left origin)
+            xmin = xmin_px / tex_width
+            ymin = 1.0 - (ymax_px / tex_height)
+            xmax = xmax_px / tex_width
+            ymax = 1.0 - (ymin_px / tex_height)
+
+            if uv_direction == "down":
+                rotation = (rotation + 180) % 360
+
+            # apply rotation
+            k = face.loop_start
+            if rotation == 0:
+                uv_layer[k].uv[0:2] = xmax, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymin
+
+            elif rotation == 90:
+                uv_layer[k].uv[0:2] = xmax, ymax
+                uv_layer[k+1].uv[0:2] = xmin, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymin
+                uv_layer[k+3].uv[0:2] = xmax, ymin
+
+            elif rotation == 180:
+                uv_layer[k].uv[0:2] = xmin, ymax
+                uv_layer[k+1].uv[0:2] = xmin, ymin
+                uv_layer[k+2].uv[0:2] = xmax, ymin
+                uv_layer[k+3].uv[0:2] = xmax, ymax
+
+            elif rotation == 270:
+                uv_layer[k].uv[0:2] = xmin, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymin
+                uv_layer[k+2].uv[0:2] = xmax, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymax
+
+            else:  # invalid rotation, should never occur... do default
+                uv_layer[k].uv[0:2] = xmax, ymin
+                uv_layer[k+1].uv[0:2] = xmax, ymax
+                uv_layer[k+2].uv[0:2] = xmin, ymax
+                uv_layer[k+3].uv[0:2] = xmin, ymin
+
+            # assign material (kept for compatibility; post-import we collapse to a single 'skin' material)
+            if face_uv is not None and "texture" in face_uv:
+                tex_name = face_uv["texture"][1:]  # remove the "#" in start
+                if tex_name in mesh_materials:
+                    face.material_index = mesh_materials[tex_name]
+                else:
+                    if not tex_name in textures:
+                        textures[tex_name] = create_textured_principled_bsdf(tex_name, tex_name, 2, tex_width, tex_height)
+                    idx = len(obj.data.materials)
+                    obj.data.materials.append(textures[tex_name])
+                    mesh_materials[tex_name] = idx
+                    face.material_index = idx
+
+
+    # set name (store VS name for animation mapping; Blender names may normalize whitespace)
+    vs_name = e.get("name") or "cube"
+    obj["vs_name"] = vs_name
+    obj.name = vs_name.strip()
+    # Remember the Blender-visible name at import time so we can detect user renames later
+    obj["vs_import_blender_name"] = obj.name
 
     # assign step parent name
     if "stepParentName" in e:
@@ -349,243 +448,298 @@ def parse_attachpoint(
     return obj
 
 
-def rebuild_hierarchy_with_bones(
-    root_objects,
-):
-    """Wrapper to make armature and replace cubes in hierarchy
-    with bones. This is multi step process due to how Blender
-    EditBone and PoseBones work
+def rebuild_hierarchy_with_bones(root_objects):
+    """Create an armature that mirrors the imported object hierarchy and
+    bone-parent all mesh objects to it WITHOUT changing their world transforms.
+
+    This is critical for Vintage Story animations: the JSON keyframes animate
+    named nodes, so we need stable names and stable rest pose.
+
+    Notes:
+    - We only create bones for mesh objects (cubes). Attach points and other
+      helpers remain regular objects.
+    - Object names in VS JSON sometimes contain trailing spaces. Blender tends to
+      normalize names, so we store the original name in obj['vs_name'] and
+      store the same on the corresponding bone for reliable mapping.
     """
-    bpy.ops.object.mode_set(mode="OBJECT") # ensure correct starting context
-    bpy.ops.object.add(type="ARMATURE", enter_editmode=True)
-    armature = bpy.context.active_object
-    armature.show_in_front = True
-
-    for obj in root_objects:
-        add_bone_to_armature_from_object(
-            obj,
-            armature,
-            None,
-        )
-    
-    # switch to pose mode, set bone positions from object transform
-    bpy.ops.object.mode_set(mode="POSE")
-    for obj in root_objects:
-        set_bone_pose_from_object(
-            obj,
-            armature,
-        )
-    
-    # set rest pose, not sure if we want this or not...
-    bpy.ops.pose.armature_apply()
-
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    return armature
+    # create armature at origin, in edit mode
+    bpy.ops.object.add(type="ARMATURE", enter_editmode=True)
+    armature_obj = bpy.context.active_object
+    armature_obj.show_in_front = True
+    arm_data = armature_obj.data
+
+    # collect mesh objects in a stable order (preorder)
+    mesh_objs = []
+
+    def collect_meshes(o):
+        if isinstance(getattr(o, "data", None), bpy.types.Mesh):
+            mesh_objs.append(o)
+        for ch in list(o.children):
+            collect_meshes(ch)
+
+    for ro in root_objects:
+        collect_meshes(ro)
+
+    # create bones in edit mode, using the object's world transform (armature space)
+    edit_bones = arm_data.edit_bones
+
+    def add_bone_for_object(o, parent_bone=None):
+        bname = o.name
+        eb = edit_bones.new(bname)
+
+        vs_name = o.get("vs_name", bname)
+        eb["vs_name"] = vs_name  # store original VS name for later mapping
+        eb["vs_import_blender_name"] = bname
+
+        # object world matrix -> armature local matrix
+        mat = armature_obj.matrix_world.inverted_safe() @ o.matrix_world
+        loc, rot, _scale = mat.decompose()
+        mat_noscale = rot.to_matrix().to_4x4()
+        mat_noscale.translation = loc
+
+        # set orientation/position
+        eb.matrix = mat_noscale
+        eb.head = loc
+
+        # give it a small length along the bone's local +Y axis
+        y_axis = rot.to_matrix() @ Vector((0.0, 0.05, 0.0))
+        eb.tail = loc + y_axis
+
+        if parent_bone is not None:
+            eb.parent = parent_bone
+            eb.use_connect = False
+
+        # recurse
+        for ch in list(o.children):
+            if isinstance(getattr(ch, "data", None), bpy.types.Mesh):
+                add_bone_for_object(ch, eb)
+            else:
+                # still recurse through non-mesh nodes so grandchildren meshes are not skipped
+                def recurse_nonmesh(n, parent_b):
+                    for g in list(n.children):
+                        if isinstance(getattr(g, "data", None), bpy.types.Mesh):
+                            add_bone_for_object(g, parent_b)
+                        else:
+                            recurse_nonmesh(g, parent_b)
+                recurse_nonmesh(ch, eb)
+
+    # build bone tree from current object tree
+    for ro in root_objects:
+        if isinstance(getattr(ro, "data", None), bpy.types.Mesh):
+            add_bone_for_object(ro, None)
+        else:
+            # root can be non-mesh; recurse until we find mesh descendants
+            for ch in list(ro.children):
+                if isinstance(getattr(ch, "data", None), bpy.types.Mesh):
+                    add_bone_for_object(ch, None)
+
+    # exit edit mode
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # IMPORTANT: preserve world transforms while re-parenting.
+    # First, snapshot world matrices for every mesh object, then unparent them,
+    # then bone-parent and restore world matrices.
+    world_mats = {o: o.matrix_world.copy() for o in mesh_objs}
+
+    for o in mesh_objs:
+        o.parent = None
+
+    for o in mesh_objs:
+        o.parent = armature_obj
+        o.parent_type = "BONE"
+        o.parent_bone = o.name
+        o.matrix_world = world_mats[o]
+
+    # import should show the clean rig/rest pose by default
+    armature_obj.data.pose_position = "POSE"  # default to Pose so imported Actions preview
+
+    return armature_obj
 
 
-def add_bone_to_armature_from_object(
-    obj,
-    armature,
-    parent_bone,
-):
-    # skip non mesh (e.g. attach points)
-    if not isinstance(obj.data, bpy.types.Mesh):
-        return
-    
-    bone = armature.data.edit_bones.new(obj.name)
-
-    # this orients bone to blender XYZ
-    bone.head = (0., 0., 0.)
-    bone.tail = (0., 1., 0.)
-
-    if parent_bone is not None:
-        bone.parent = parent_bone
-        bone.use_connect = False
-    
-    for child in obj.children:
-        add_bone_to_armature_from_object(
-            child,
-            armature,
-            bone,
-        )
+def resolve_bone_name(armature_obj, vs_name):
+    """Resolve a VS animation element name to an existing Blender bone name."""
+    bones = armature_obj.data.bones
+    if vs_name in bones:
+        return vs_name
+    stripped = vs_name.strip()
+    if stripped in bones:
+        return stripped
+    # fall back: search by stored vs_name on bones
+    for b in bones:
+        if b.get("vs_name", "").strip() == vs_name.strip():
+            return b.name
+    return None
 
 
-def set_bone_pose_from_object(
-    obj,
-    armature,
-):
-    # skip non mesh (e.g. attach points)
-    if not isinstance(obj.data, bpy.types.Mesh):
-        return
-    
-    name = obj.name
-    pose_bone = armature.pose.bones[name]
-    pose_bone.location = (
-        obj.location.x,
-        obj.location.y,
-        obj.location.z,
-    )
-    pose_bone.rotation_mode = "XYZ"
-    pose_bone.rotation_euler = obj.rotation_euler
-    
-    # now parent obj to bone
-    obj.parent = armature
-    obj.parent_type = "BONE"
-    obj.parent_bone = name
-    obj.location = (0., -1.0, 0.)
-    obj.rotation_euler = (0., 0., 0.)
+def parse_animation(e, armature_obj, stats):
+    """Import a Vintage Story animation (current format only) as a Blender Action.
 
-    for child in obj.children:
-        set_bone_pose_from_object(
-            child,
-            armature,
-        )
+    We intentionally do NOT support VS animation version 0 here per user request.
+    Missing 'version' is treated as current (v1).
+    """
+    action_name = e.get("code") or e.get("name") or "vs_anim"
+    action = bpy.data.actions.new(name=action_name)
+    action.use_fake_user = True
 
+    # preserve original VS name/code for roundtrip
+    if "name" in e:
+        action["vs_anim_name"] = e.get("name")
+    if "code" in e:
+        action["vs_anim_code"] = e.get("code")
 
-def parse_animation(
-    e,        # json element
-    armature, # armature to associate action with
-    stats,    # import stats
-):
-    def add_keyframe_point(fcu, frame, val):
-        """Helper to add keyframe point to fcurve"""
-        idx = len(fcu.keyframe_points)
-        fcu.keyframe_points.add(1)
-        fcu.keyframe_points[idx].interpolation = "LINEAR"
-        fcu.keyframe_points[idx].co = frame, val
-
-    name = e["code"] # use code as name instead of name field
-    action = bpy.data.actions.new(name=name)
-    action.use_fake_user = True # prevents deletion on file save
-
-    # add onActivityStopped and onAnimationEnd metadata
+    # metadata passthrough
     if "onAnimationEnd" in e:
         action["on_animation_end"] = e["onAnimationEnd"]
     if "onActivityStopped" in e:
         action["on_activity_stopped"] = e["onActivityStopped"]
 
-    # load keyframe data
-    animation_adapter = animation.AnimationAdapter(action, name=name)
-    keyframes = e["keyframes"].copy()
-    for keyframe in keyframes:
-        frame = keyframe["frame"]
-        for bone_name, data in keyframe["elements"].items():
-            fcu_name_prefix = "pose.bones[\"{}\"]".format(bone_name)
-            fcu_name_location = fcu_name_prefix + ".location"
-            fcu_name_rotation = fcu_name_prefix + ".rotation_euler"
+    # preserve quantityframes for roundtrip export
+    if "quantityframes" in e:
+        try:
+            action["vs_quantityframes"] = int(e["quantityframes"])
+        except Exception:
+            pass
 
-            # add bone => rotation mode
-            animation_adapter.set_bone_rotation_mode(bone_name, "rotation_euler")
+    # Ensure armature has animation data and bind the Action to the armature.
+    #
+    # Blender 4.x uses "Action Slots" under the hood. If you author fcurves on an
+    # unbound Action, Blender may later create a fresh empty slot when you assign
+    # the Action to an object, making the Action *look* populated (fcurves exist)
+    # but evaluate as blank.
+    #
+    # Keying via PoseBone.keyframe_insert while the Action is assigned guarantees
+    # the keys go into the correct slot and will evaluate when you switch Actions.
+    armature_obj.animation_data_create()
+    armature_obj.animation_data.action = action
 
-            # position fcurves
-            fcu_px = animation_adapter.get(fcu_name_location, 0)
-            fcu_py = animation_adapter.get(fcu_name_location, 1)
-            fcu_pz = animation_adapter.get(fcu_name_location, 2)
-            
-            # euler rotation fcurves
-            fcu_rx = animation_adapter.get(fcu_name_rotation, 0)
-            fcu_ry = animation_adapter.get(fcu_name_rotation, 1)
-            fcu_rz = animation_adapter.get(fcu_name_rotation, 2)
+    scene = bpy.context.scene
+    prev_frame = scene.frame_current
 
-            # add keyframe points (note vintage story ZXY -> XYZ)
-            if "offsetX" in data:
-                add_keyframe_point(fcu_py, frame, data["offsetX"])
-            if "offsetY" in data:
-                add_keyframe_point(fcu_pz, frame, data["offsetY"])
-            if "offsetZ" in data:
-                add_keyframe_point(fcu_px, frame, data["offsetZ"])
-            
-            bone = armature.data.bones[bone_name]
-            bone_rot = bone.matrix_local.copy()
-            bone_rot.translation = Vector((0., 0., 0.))
+    # cache original pose for touched bones so import leaves the model in rest pose
+    touched = {}
 
-            # _, bone_rot_quat, _ = bone.matrix_local.decompose()
-            # bone_rot_euler = bone_rot_quat.to_euler("XYZ")
+    def cache_pose(pb):
+        if pb.name in touched:
+            return
+        touched[pb.name] = (pb.location.copy(), pb.rotation_euler.copy(), pb.rotation_mode)
 
-            rx = data["rotationX"] * DEG_TO_RAD if "rotationX" in data else None
-            ry = data["rotationY"] * DEG_TO_RAD if "rotationY" in data else None
-            rz = data["rotationZ"] * DEG_TO_RAD if "rotationZ" in data else None
-            if rx is not None or ry is not None or rz is not None:
-                rx = rx if rx is not None else 0.0
-                ry = ry if ry is not None else 0.0
-                rz = rz if rz is not None else 0.0
-                rot_vs_original = Euler((rz, rx, ry), "XZY")
-                rot_vs = Euler((rz, rx, ry), "XZY").to_quaternion().to_euler("XYZ")
-                rx = rot_vs.x
-                ry = rot_vs.y
-                rz = rot_vs.z
 
-                if bone.parent is not None:
-                    mat_local = bone.parent.matrix_local.inverted_safe() @ bone.matrix_local
-                else:
-                    mat_local = bone.matrix_local.copy()
-                
-                bone_rot_local = mat_local.copy()
-                bone_rot_local.translation = Vector((0., 0., 0.))
-
-                _, bone_rot_quat, _ = mat_local.decompose()
-
-                bone_rot_eff = bone_rot_quat.to_euler("XYZ")
-                bone_rot_eff.x += rx
-                bone_rot_eff.y += ry
-                bone_rot_eff.z += rz
-                # print(bone.name, "bone_rot_eff", bone_rot_eff, "bone_rot_local", bone_rot_local.to_euler("XYZ"))
-
-                rot_eff = bone_rot_eff.to_matrix().to_4x4()
-                rot_mat = rot_eff @ bone_rot_local.inverted_safe()
-                rot = rot_mat.to_euler("XYZ")
-
-                # debugging
-                # rot_result_mat = rot.to_matrix().to_4x4() @ bone_rot_local
-                # rot_result = rot_result_mat.to_euler("XYZ")
-                # if bone.name == "tail":
-                #     print(bone.name, "rot_vs:", rot_vs, "rot_vs_original:", rot_vs_original)
-                #     print(bone.name, "using direct values:", Euler((rz, rx, ry), "XYZ"), "rot:", rot, "target_rot:", bone_rot_eff)
-                #     print(bone.name, "ROT RESULT", rot_result, rot_result.x * animation.RAD_TO_DEG, rot_result.y * animation.RAD_TO_DEG, rot_result.z * animation.RAD_TO_DEG)
-                #     print("rot_result * rot_local = ", rot_mat @ bone_rot_local)
-                #     print("rot_eff = ", rot_eff, rot_eff.to_euler("XYZ"))
-                #     print("rot_result = ", rot_result_mat, rot_result_mat.to_euler("XYZ"))
-
-                # transform to bone euler
-                ax_angle, theta = rot.to_quaternion().to_axis_angle()
-                transformed_ax_angle = bone_rot_local.inverted_safe() @ ax_angle
-                rot = Quaternion(transformed_ax_angle, theta).to_euler("XYZ")
-
-                # ax_angle, theta = bone_rot_eff.to_quaternion().to_axis_angle()
-                # transformed_ax_angle = bone_rot.inverted_safe() @ ax_angle
-                # rot = Quaternion(transformed_ax_angle, theta).to_euler("XYZ")
-
-                # rot = Euler((rz, rx, ry), "XZY")
-                # ax_angle, theta = rot.to_quaternion().to_axis_angle()
-                # if bone.parent is not None:
-                #     parent_bone = bone.parent
-                #     parent_bone_rot = parent_bone.matrix_local.copy()
-                #     parent_bone_rot.translation = Vector((0., 0., 0.))
-                #     transformed_ax_angle = parent_bone_rot @ (bone_rot.inverted_safe() @ ax_angle)
-                # else:
-                #     transformed_ax_angle = bone_rot.inverted_safe() @ ax_angle
-                # rot = Quaternion(transformed_ax_angle, theta).to_euler("XYZ")
-                
-                # vs: rotation relative to parent axis, need to convert
-                add_keyframe_point(fcu_rx, frame, rot.x)
-                add_keyframe_point(fcu_ry, frame, rot.y)
-                add_keyframe_point(fcu_rz, frame, rot.z)
-            
-            # vs: rotation relative to parent axis, need to convert
-            # if "rotationX" in data:
-            #     add_keyframe_point(fcu_ry, frame, data["rotationX"] * DEG_TO_RAD)
-            # if "rotationY" in data:
-            #     add_keyframe_point(fcu_rz, frame, data["rotationY"] * DEG_TO_RAD)
-            # if "rotationZ" in data:
-            #     add_keyframe_point(fcu_rx, frame, data["rotationZ"] * DEG_TO_RAD)
+    # Import keyframes
+    keyframes = e.get("keyframes", []) or []
     
-    # resample animations for blender
-    animation_adapter.resample_to_blender()
-
-    # update stats
-    stats.animations += 1
-
+    # VS exports are usually integer frame indices (0..quantityframes-1).
+    # Some pipelines export normalized time (0..1) or fractional frames.
+    # Older versions of this importer rounded to int, which can collapse all keys to frame 0/1.
+    fps = float(scene.render.fps) if scene.render.fps else 30.0
+    
+    qf = None
+    try:
+        qf_val = e.get("quantityframes")
+        qf = int(qf_val) if qf_val is not None else None
+    except Exception:
+        qf = None
+    
+    # Pre-scan frames to decide whether we need to scale normalized time.
+    raw_frames = []
+    for kf in keyframes:
+        fr = kf.get("frame", 0)
+        try:
+            raw_frames.append(float(fr))
+        except Exception:
+            raw_frames.append(0.0)
+    
+    max_raw = max(raw_frames) if raw_frames else 0.0
+    min_raw = min(raw_frames) if raw_frames else 0.0
+    
+    # Detect normalized 0..1 time when quantityframes is present.
+    normalized = (qf is not None and qf > 1 and max_raw <= 1.000001 and min_raw >= -0.000001)
+    
+    max_frame_written = 0.0
+    
+    for keyframe, raw in zip(keyframes, raw_frames):
+        frame = raw
+        if normalized:
+            frame = raw * float(qf - 1)
+    
+        # Track last written key for setting scene range.
+        if frame > max_frame_written:
+            max_frame_written = frame
+    
+        # Keep Blender's internal time in sync (some builds/operators rely on it),
+        # but preserve subframe accuracy.
+        fi = int(math.floor(frame))
+        scene.frame_set(fi, subframe=float(frame - fi))
+    
+        elements = keyframe.get("elements", {}) or {}
+        for vs_bone_name, data in elements.items():
+            bone_name = resolve_bone_name(armature_obj, vs_bone_name)
+            if bone_name is None:
+                continue
+    
+            pb = armature_obj.pose.bones.get(bone_name)
+            if pb is None:
+                continue
+            cache_pose(pb)
+    
+            pb.rotation_mode = "XZY"
+    
+            # translation: VS (X,Y,Z) -> Blender (Z,X,Y) -> (X,Y,Z) = (offsetZ, offsetX, offsetY)
+            ox = float(data.get("offsetX", 0.0) or 0.0)
+            oy = float(data.get("offsetY", 0.0) or 0.0)
+            oz = float(data.get("offsetZ", 0.0) or 0.0)
+            pb.location = Vector((oz, ox, oy))
+    
+            # rotation: VS (X,Y,Z) -> Blender Euler XZY with components (Z,X,Y)
+            rx = float(data.get("rotationX", 0.0) or 0.0) * DEG_TO_RAD
+            ry = float(data.get("rotationY", 0.0) or 0.0) * DEG_TO_RAD
+            rz = float(data.get("rotationZ", 0.0) or 0.0) * DEG_TO_RAD
+            pb.rotation_euler = (rz, rx, ry)
+    
+            # insert keys (use full channels to keep curves stable when VS omits components)
+            if any(k in data for k in ("offsetX", "offsetY", "offsetZ")):
+                pb.keyframe_insert(data_path="location", index=0, frame=frame)
+                pb.keyframe_insert(data_path="location", index=1, frame=frame)
+                pb.keyframe_insert(data_path="location", index=2, frame=frame)
+    
+            # VS commonly relies on default 0 rotations, so always key rotations for authored bones
+            pb.keyframe_insert(data_path="rotation_euler", index=0, frame=frame)
+            pb.keyframe_insert(data_path="rotation_euler", index=1, frame=frame)
+            pb.keyframe_insert(data_path="rotation_euler", index=2, frame=frame)
+    
+    # Expand scene range to cover imported keys (nice for immediate playback).
+    try:
+        end_frame = int(math.ceil(max_frame_written))
+        if end_frame > scene.frame_end:
+            scene.frame_end = end_frame
+        # VS commonly starts at frame 0.
+        if scene.frame_start > 0:
+            scene.frame_start = 0
+    except Exception:
+        pass
+    
+    # make all keyframe interpolation linear (VS style)
+        for fcu in action.fcurves:
+            for kp in fcu.keyframe_points:
+                kp.interpolation = "LINEAR"
+    
+        # restore scene frame and bone poses
+        scene.frame_set(prev_frame)
+        for bname, (loc, rot, mode) in touched.items():
+            pb = armature_obj.pose.bones.get(bname)
+            if pb is None:
+                continue
+            pb.location = loc
+            pb.rotation_mode = mode
+            pb.rotation_euler = rot
+    
+        # update stats
+        if stats:
+            stats.animations += 1
+    
+        return action
+    
 
 def load_element(
     element,
@@ -615,6 +769,13 @@ def load_element(
     # set parent
     if parent is not None:
         obj.parent = parent
+        # Preserve the original VS hierarchy for exporters/animation baking.
+        # After rig creation we bone-parent meshes, which would otherwise erase the
+        # object parenting information.
+        try:
+            obj["vs_parent"] = parent.get("vs_name", parent.name)
+        except Exception:
+            pass
         # We want VS transforms to be interpreted in parent space (not world space).
         # Force parent inverse to identity so obj.matrix_basis is direct local transform.
         obj.matrix_parent_inverse = Matrix.Identity(4)
@@ -636,6 +797,10 @@ def load_element(
                 local_cube_origin,
             )
             p.parent = obj
+            try:
+                p["vs_parent"] = obj.get("vs_name", obj.name)
+            except Exception:
+                pass
             try:
                 if 'vs_desired_loc' in p and 'vs_desired_rot' in p:
                     p.matrix_parent_inverse = Matrix.Identity(4)
@@ -721,6 +886,8 @@ def load(context,
     # objects created
     root_objects = []  # root level objects
     all_objects = []   # all objects added
+    armature = None  # created if animations are imported
+
 
     # vintage story coordinate system origin
     if translate_origin is not None:
@@ -745,6 +912,16 @@ def load(context,
     """
     tex_width = data["textureWidth"] if "textureWidth" in data else 16.0
     tex_height = data["textureHeight"] if "textureHeight" in data else 16.0
+
+    # Store declared texture size on the scene so exports can scale UVs correctly (e.g. for VSMC).
+    # This avoids relying on image node sizes, which may be scaled for authoring convenience.
+    try:
+        scn = bpy.context.scene
+        scn["vs_textureWidth"] = float(tex_width)
+        scn["vs_textureHeight"] = float(tex_height)
+    except Exception:
+        pass
+
     textures = {}
     if import_textures and "textures" in data:
         # get textures base path for models
@@ -890,9 +1067,108 @@ def load(context,
         armature = rebuild_hierarchy_with_bones(root_objects)
 
         # load animations
+        first_action = None
         for anim in data["animations"]:
-            parse_animation(anim, armature, stats)
+            anim = copy.deepcopy(anim)
+            act = parse_animation(anim, armature, stats)
+            if first_action is None and act is not None:
+                first_action = act
+
+        # Assign a default action so switching Armature to Pose Position immediately previews.
+        # In Rest Position the model stays in rig pose.
+        if first_action is not None:
+            armature.animation_data.action = first_action
     
+
+    # =============================================
+    # Post-import cleanup
+    # =============================================
+
+    def _vs_sync_object_data_names(objs):
+        """Make datablock names match object names for unique users.
+        Helps keep Mesh/Armature datablocks stable for export and editing."""
+        for o in objs:
+            data = getattr(o, "data", None)
+            if data is None:
+                continue
+            try:
+                if getattr(data, "users", 0) == 1:
+                    data.name = o.name
+            except Exception:
+                pass
+
+    def _vs_postprocess_single_skin(mesh_objs):
+        """Remove all materials on imported meshes and assign a single shared 'skin' material."""
+        # Create or get the shared material
+        skin = bpy.data.materials.get("skin")
+        if skin is None:
+            skin = bpy.data.materials.new("skin")
+            try:
+                skin.use_nodes = True
+            except Exception:
+                pass
+
+        # Track materials that were previously used by imported meshes so we can purge unused ones.
+        prev_mats = set()
+        for o in mesh_objs:
+            try:
+                for m in getattr(o.data, "materials", []) or []:
+                    if m is not None:
+                        prev_mats.add(m)
+            except Exception:
+                pass
+
+        # Clear + assign only skin
+        for o in mesh_objs:
+            me = getattr(o, "data", None)
+            if not isinstance(me, bpy.types.Mesh):
+                continue
+
+            # clear material slots
+            try:
+                me.materials.clear()
+            except Exception:
+                # fallback for older APIs
+                while len(me.materials) > 0:
+                    me.materials.pop(index=len(me.materials) - 1)
+
+            me.materials.append(skin)
+
+            # force all faces to material slot 0
+            try:
+                polys = getattr(me, "polygons", None)
+                if polys is not None:
+                    for p in polys:
+                        p.material_index = 0
+            except Exception:
+                pass
+
+        # Remove now-unused materials that were only introduced by this import
+        for m in list(prev_mats):
+            if m is None:
+                continue
+            if m.name == "skin":
+                continue
+            try:
+                if m.users == 0:
+                    bpy.data.materials.remove(m)
+            except Exception:
+                pass
+
+    # Set armature display to rest pose so the model imports in rest pose.
+    # This does not delete or modify any actions/keyframes.
+    if armature is not None:
+        try:
+            armature.data.pose_position = "REST"
+        except Exception:
+            pass
+
+    # Apply single-material policy to imported mesh objects
+    _vs_postprocess_single_skin([o for o in all_objects if isinstance(getattr(o, "data", None), bpy.types.Mesh)])
+
+    # Sync datablock names after the import has finished creating/linking objects
+    _vs_sync_object_data_names(all_objects + ([armature] if armature is not None else []))
+
     # select newly imported objects
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
