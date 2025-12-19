@@ -1492,6 +1492,7 @@ def save_objects(
     use_step_parent=True,
     rotate_shortest_distance=True,
     animation_version_0=False,
+    resolution=2,
     logger=None,
     **kwargs
 ) -> tuple[set[str], set[str], str]:
